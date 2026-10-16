@@ -1,0 +1,41 @@
+'use strict';
+const { wrapCallable } = require('../adapter');
+const { getOtpCore } = require('../sms/core');
+const { makeClaimVerification } = require('../sms/lib/handlers');
+module.exports = wrapCallable(makeClaimVerification, getOtpCore);
+
+'use strict';
+const { wrapCallable } = require('../adapter');
+const { getPaymentCore } = require('../lib/core');
+const { makeCreatePayment } = require('../lib/handlers');
+module.exports = wrapCallable(makeCreatePayment, getPaymentCore);
+
+'use strict';
+const { wrapRaw } = require('../adapter');
+const { getPaymentCore } = require('../lib/core');
+const { makeMockPay } = require('../lib/handlers');
+module.exports = wrapRaw(makeMockPay, getPaymentCore);
+
+'use strict';
+const { wrapRaw } = require('../adapter');
+const { getPaymentCore } = require('../lib/core');
+const { makeWebhook } = require('../lib/handlers');
+module.exports = wrapRaw(makeWebhook, getPaymentCore);
+
+'use strict';
+const { wrapCallable } = require('../adapter');
+const { getOtpCore } = require('../sms/core');
+const { makeRequestOtp } = require('../sms/lib/handlers');
+module.exports = wrapCallable(makeRequestOtp, getOtpCore);
+
+'use strict';
+const { wrapCallable } = require('../adapter');
+const { getOtpCore } = require('../sms/core');
+const { makeResetPassword } = require('../sms/lib/handlers');
+module.exports = wrapCallable(makeResetPassword, getOtpCore);
+
+'use strict';
+const { wrapCallable } = require('../adapter');
+const { getOtpCore } = require('../sms/core');
+const { makeVerifyOtp } = require('../sms/lib/handlers');
+module.exports = wrapCallable(makeVerifyOtp, getOtpCore);

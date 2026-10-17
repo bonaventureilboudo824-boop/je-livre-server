@@ -8,6 +8,11 @@
 //   const shared = require('../shared');
 // ====================================================================
 
+// Chargé ici, au tout premier niveau du fichier (et non à l'intérieur d'une
+// fonction imbriquée), pour que Vercel le repère sans ambiguïté à la
+// construction et l'inclue bien dans le paquet déployé.
+const __firebaseAdminPkg = require('firebase-admin');
+
 const __modules = {};
 const __cache = {};
 function __define(key, factory) { __modules[key] = factory; }
@@ -165,7 +170,7 @@ __define('firebaseAdmin', function (module, exports, require) {
 // nouvelle clé privée), collé tel quel dans la variable d'environnement
 // FIREBASE_SERVICE_ACCOUNT (jamais dans un fichier du dépôt).
 
-const admin = require('firebase-admin');
+const admin = __firebaseAdminPkg;
 
 let appInstance = null;
 

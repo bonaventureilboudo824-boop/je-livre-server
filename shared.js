@@ -773,6 +773,7 @@ function createOtpCore({ db, provider, hash, now = () => Date.now(), random = Ma
     try {
       await provider.sendSms({ phone, phoneKey, text: 'Je Livre : votre code de vérification est ' + code + '. Il expire dans 5 minutes.' });
     } catch (e) {
+      console.error('[sms] échec réel du prestataire :', e && e.message);
       await db.ref('otps/' + phoneKey).remove();
       throw new OtpError('unavailable', "L'envoi du SMS a échoué. Réessayez dans un instant.");
     }

@@ -151,7 +151,7 @@ function getPaymentCore() {
     webhookUrl: process.env.WEBHOOK_URL || (serverBaseUrl() + '/api/paymentWebhook'),
   };
   const allowedUids = () => (process.env.MOCK_TEST_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const provider = getProvider(providerName, { db, urls, allowedUids });
+  const provider = getProvider(providerName, { db, urls, allowedUids, token: process.env.HORUSPAY_SECRET_KEY });
   return { core: createPaymentCore({ db, provider, providerName, urls }), provider, providerName };
 }
 
@@ -565,6 +565,8 @@ function getProvider(name, deps) {
   switch (name) {
     case 'mock':
       return __require('paymentProviderMock')(deps);
+    case 'horuspay':
+      return __require('paymentProviderHoruspay')(deps);
     // case 'cinetpay': return require('./cinetpay')(deps);
     // case 'paydunya': return require('./paydunya')(deps);
     default:
@@ -623,6 +625,123 @@ module.exports = function createMockProvider({ db, urls, allowedUids = () => [] 
       if (!rec || !isAllowed(rec.uid)) return false;
       await ref.child('status').set(result === 'paid' ? 'paid' : 'failed');
       return true;
+    },
+  };
+};
+
+});
+
+// ---------- providers/horuspay.js ----------
+__define('paymentProviderHoruspay', function (module, exports, require) {
+'use strict';
+
+// Adaptateur HorusPay (Afrique de l'Ouest) — https://docs.horuspay.africa
+//
+// Une seule adresse existe réellement : https://api.horuspay.africa — le
+// mode test/réel se détermine par le TYPE de clé utilisée (visible sur le
+// tableau de bord HorusPay), pas par l'adresse. (Leur documentation mentionne
+// par erreur "sandbox-api.horuspay.com", une adresse qui n'appartient même
+// pas à HorusPay — confirmé en testant directement.)
+//
+// HorusPay exprime les montants en « unités mineures » (le montant réel
+// multiplié par 100), même pour le XOF qui n'a normalement pas de centimes
+// — on respecte ce format à l'envoi, et on divise par 100 à la vérification.
+//
+// Vérification de signature des webhooks : volontairement NON implémentée
+// ici. Ce n'est pas un relâchement de la sécurité — dans cette architecture,
+// paymentCore ne fait JAMAIS confiance au contenu d'un webhook de toute
+// façon : il s'en sert uniquement comme signal "va vérifier maintenant",
+// puis revérifie indépendamment via verifyTransaction (un appel direct à
+// HorusPay). Un faux webhook ne peut donc, au pire, que déclencher une
+// vérification inutile — jamais débloquer un paiement non confirmé.
+
+const BASE_URL = 'https://api.horuspay.africa';
+
+const STATUS_MAP = {
+  approved: 'paid',
+  transferred: 'paid',
+  declined: 'failed',
+  canceled: 'failed',
+  expired: 'failed',
+  refunded: 'failed', // remboursé : ne doit plus compter comme payé chez nous
+  pending: 'pending',
+};
+
+module.exports = function createHorusPayProvider({ token }) {
+  async function apiCall(path, { method = 'GET', body } = {}) {
+    if (!token) throw new Error('HORUSPAY_SECRET_KEY manquant.');
+    let res;
+    try {
+      res = await fetch(BASE_URL + path, {
+        method,
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) {
+      throw new Error('HorusPay injoignable : ' + e.message);
+    }
+    let json;
+    try {
+      json = await res.json();
+    } catch (e) {
+      throw new Error('Réponse HorusPay illisible (HTTP ' + res.status + ').');
+    }
+    if (!res.ok) {
+      throw new Error((json && json.message) || ('Échec HorusPay (HTTP ' + res.status + ').'));
+    }
+    return json;
+  }
+
+  return {
+    name: 'horuspay',
+
+    async createCheckout({ txId, amount, currency, customer, returnUrl }) {
+      const data = await apiCall('/accounts/transactions', {
+        method: 'POST',
+        body: {
+          amount: Math.round(amount * 100), // unités mineures (centimes), même pour le XOF
+          currency,
+          callback_url: returnUrl,
+          // Deux façons redondantes de retrouver NOTRE identifiant de paiement
+          // plus tard (dans le webhook) : HorusPay promet explicitement que
+          // merchant_reference sert à ça.
+          merchant_reference: txId,
+          custom_metadata: { txId },
+          customer: {
+            country_code: 'BF',
+            phone: customer && customer.phone ? { number: customer.phone, country: 'bf' } : undefined,
+          },
+        },
+      });
+      if (!data || !data.payment_url || data.id == null) {
+        throw new Error('Réponse HorusPay incomplète (pas de lien de paiement).');
+      }
+      return { paymentUrl: data.payment_url, providerRef: String(data.id) };
+    },
+
+    // Ne fait JAMAIS confiance au contenu du webhook : redemande toujours
+    // l'état réel directement à HorusPay, par un appel serveur à serveur.
+    async verifyTransaction({ providerRef }) {
+      if (!providerRef) return { status: 'pending' };
+      const data = await apiCall('/accounts/transactions/' + providerRef);
+      const status = STATUS_MAP[data.status] || 'pending';
+      return {
+        status,
+        amount: typeof data.amount === 'number' ? data.amount / 100 : undefined,
+        currency: data.currency,
+      };
+    },
+
+    // Extrait NOTRE identifiant de paiement du contenu envoyé par HorusPay
+    // (le corps est la transaction elle-même, sérialisée en JSON).
+    parseWebhook(req) {
+      const body = req.body || {};
+      const txId = body.merchant_reference || (body.custom_metadata && body.custom_metadata.txId);
+      return { txId };
     },
   };
 };

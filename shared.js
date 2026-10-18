@@ -215,7 +215,7 @@ __define('paymentCore', function (module, exports, require) {
 //                       — une seule fois — passe les commandes en "pending_seller"
 //                       / paymentStatus "paid". Seul le serveur peut faire ça.
 
-const { PaymentError, computeOrderAmounts } = __require('amounts');
+const { PaymentError, computeOrderAmounts, computeDeliveryRequestAmount } = __require('amounts');
 
 const CURRENCY = 'XOF';
 const MIN_AMOUNT = 100;            // FCFA — la plupart des prestataires refusent en dessous
@@ -225,6 +225,7 @@ const LOCK_MS = 120000;            // un verrou de traitement plus vieux que 2 m
 const FINAL_STATUSES = ['paid', 'paid_needs_review', 'amount_mismatch'];
 const ORDER_ID_RE = /^CMD-[A-Z0-9]{3,24}$/;
 const TX_ID_RE = /^JL[A-Z0-9]{6,30}$/;
+const DELIVERY_REQUEST_ID_RE = /^dr_[a-z0-9]{3,40}$/;
 
 function createPaymentCore({ db, provider, providerName, urls, now = () => Date.now(), random = Math.random }) {
   const readVal = async (path) => (await db.ref(path).once('value')).val();
@@ -234,8 +235,9 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
     return 'JL' + now().toString(36).toUpperCase() + rand;
   }
 
-  async function createPayment({ uid, orderIds }) {
+  async function createPayment({ uid, orderIds, deliveryRequestId }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (deliveryRequestId != null) return createDeliveryPayment({ uid, deliveryRequestId });
     if (!Array.isArray(orderIds) || orderIds.length < 1 || orderIds.length > MAX_ORDERS_PER_PAYMENT
         || new Set(orderIds).size !== orderIds.length
         || !orderIds.every((id) => typeof id === 'string' && ORDER_ID_RE.test(id))) {
@@ -326,6 +328,68 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
     return { txId, paymentUrl: checkout.paymentUrl, amount };
   }
 
+  // Même principe que createPayment, pour une demande de livraison simple
+  // (point à point) au lieu d'une ou plusieurs commandes boutique.
+  async function createDeliveryPayment({ uid, deliveryRequestId }) {
+    if (typeof deliveryRequestId !== 'string' || !DELIVERY_REQUEST_ID_RE.test(deliveryRequestId)) {
+      throw new PaymentError('invalid-argument', 'Identifiant de demande invalide.');
+    }
+
+    const throttle = await db.ref('paymentThrottle/' + uid).transaction(
+      (cur) => (typeof cur === 'number' && now() - cur < THROTTLE_MS ? undefined : now())
+    );
+    if (!throttle.committed) {
+      throw new PaymentError('resource-exhausted', 'Veuillez patienter quelques secondes avant de réessayer.');
+    }
+
+    const req = await readVal('deliveryRequests/' + deliveryRequestId);
+    if (!req) throw new PaymentError('not-found', 'Demande de livraison introuvable.');
+    if (req.clientUid !== uid) throw new PaymentError('permission-denied', "Cette demande n'est pas la vôtre.");
+    if (req.paymentMethod !== 'online') throw new PaymentError('failed-precondition', 'Cette demande se règle à la livraison.');
+    if (req.paymentStatus === 'paid') throw new PaymentError('already-exists', 'Cette demande est déjà payée.');
+    if (req.status !== 'awaiting_payment') throw new PaymentError('failed-precondition', "Cette demande n'attend plus de paiement.");
+
+    const { distanceKm, price } = computeDeliveryRequestAmount({ request: req });
+    const amount = price;
+    if (!Number.isInteger(amount) || amount < MIN_AMOUNT) {
+      throw new PaymentError('failed-precondition', 'Montant à payer invalide.');
+    }
+
+    const txId = newTxId();
+    const updates = {};
+    // Montants autoritaires réécrits dans la demande, comme pour les commandes.
+    updates['deliveryRequests/' + deliveryRequestId + '/price'] = price;
+    updates['deliveryRequests/' + deliveryRequestId + '/distanceKm'] = distanceKm;
+    updates['deliveryRequests/' + deliveryRequestId + '/paymentTxId'] = txId;
+    updates['payments/' + txId] = {
+      txId, clientUid: uid, kind: 'delivery', requestId: deliveryRequestId, amount, currency: CURRENCY,
+      provider: providerName, status: 'initiated', createdAt: now(),
+    };
+    await db.ref().update(updates);
+
+    let checkout;
+    try {
+      checkout = await provider.createCheckout({
+        txId, amount, currency: CURRENCY,
+        description: ('Livraison Je Livre ' + deliveryRequestId).slice(0, 100),
+        customer: { uid, phone: req.senderPhone || '' },
+        returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
+        notifyUrl: urls.webhookUrl,
+      });
+    } catch (e) {
+      await db.ref('payments/' + txId).update({
+        status: 'failed_to_create', error: String(e && e.message).slice(0, 200), failedAt: now(),
+      });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    if (!checkout || !checkout.paymentUrl) {
+      await db.ref('payments/' + txId).update({ status: 'failed_to_create', error: 'no-payment-url', failedAt: now() });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    await db.ref('payments/' + txId).update({ providerRef: checkout.providerRef || null });
+    return { txId, paymentUrl: checkout.paymentUrl, amount };
+  }
+
   // Appelée quand le prestataire signale un changement (webhook), et par le
   // retour du client : elle est sans danger d'être appelée plusieurs fois.
   async function settlePayment(txId) {
@@ -363,20 +427,33 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
         return { ok: false, reason: 'amount-mismatch' };
       }
 
-      // Argent réellement reçu et montant exact : on débloque les commandes.
+      // Argent réellement reçu et montant exact : on débloque la commande ou
+      // la demande de livraison, selon le type de ce paiement.
       const updates = {};
       const problems = [];
-      for (const id of pay.orderIds) {
-        const o = await readVal('marketplaceOrders/' + id);
-        if (o && o.status === 'awaiting_payment' && o.paymentStatus !== 'paid' && o.clientUid === pay.clientUid) {
-          updates['marketplaceOrders/' + id + '/status'] = 'pending_seller';
-          updates['marketplaceOrders/' + id + '/paymentStatus'] = 'paid';
-          updates['marketplaceOrders/' + id + '/paidAt'] = now();
-          updates['marketplaceOrders/' + id + '/paymentTxId'] = txId;
+      if (pay.kind === 'delivery') {
+        const r = await readVal('deliveryRequests/' + pay.requestId);
+        if (r && r.status === 'awaiting_payment' && r.paymentStatus !== 'paid' && r.clientUid === pay.clientUid) {
+          updates['deliveryRequests/' + pay.requestId + '/status'] = 'pending';
+          updates['deliveryRequests/' + pay.requestId + '/paymentStatus'] = 'paid';
+          updates['deliveryRequests/' + pay.requestId + '/paidAt'] = now();
         } else {
-          // Commande annulée entre-temps, ou déjà payée par une autre tentative :
-          // l'argent est bien arrivé mais ne correspond plus à rien de payable.
-          problems.push(id);
+          // Demande annulée entre-temps, ou déjà payée par une autre tentative.
+          problems.push(pay.requestId);
+        }
+      } else {
+        for (const id of pay.orderIds) {
+          const o = await readVal('marketplaceOrders/' + id);
+          if (o && o.status === 'awaiting_payment' && o.paymentStatus !== 'paid' && o.clientUid === pay.clientUid) {
+            updates['marketplaceOrders/' + id + '/status'] = 'pending_seller';
+            updates['marketplaceOrders/' + id + '/paymentStatus'] = 'paid';
+            updates['marketplaceOrders/' + id + '/paidAt'] = now();
+            updates['marketplaceOrders/' + id + '/paymentTxId'] = txId;
+          } else {
+            // Commande annulée entre-temps, ou déjà payée par une autre tentative :
+            // l'argent est bien arrivé mais ne correspond plus à rien de payable.
+            problems.push(id);
+          }
         }
       }
       const finalStatus = problems.length ? 'paid_needs_review' : 'paid';
@@ -483,7 +560,25 @@ function computeOrderAmounts({ order, shop, productsById }) {
   return { items, subtotal, distanceKm, deliveryFee, total: subtotal + deliveryFee };
 }
 
-module.exports = { PaymentError, deliveryFeeForKm, haversineKm, computeOrderAmounts };
+// request : deliveryRequests/<id> telle qu'enregistrée par le client
+// (paiement en ligne réservé au type "simple" — Express/Groupée se paient
+// toujours à la livraison).
+function computeDeliveryRequestAmount({ request }) {
+  if (!request) throw new PaymentError('not-found', 'Demande de livraison introuvable.');
+  if (request.type !== 'simple') {
+    throw new PaymentError('failed-precondition', "Le paiement en ligne n'est disponible que pour les livraisons simples.");
+  }
+  const s = request.senderCoords;
+  const r = request.recipientCoords;
+  if (!s || !isNum(s.lat) || !isNum(s.lng) || !r || !isNum(r.lat) || !isNum(r.lng)) {
+    throw new PaymentError('failed-precondition', 'Position du destinataire manquante : paiement en ligne indisponible pour cette demande.');
+  }
+  const distanceKm = haversineKm(s.lat, s.lng, r.lat, r.lng);
+  const price = deliveryFeeForKm(distanceKm);
+  return { distanceKm, price };
+}
+
+module.exports = { PaymentError, deliveryFeeForKm, haversineKm, computeOrderAmounts, computeDeliveryRequestAmount };
 
 });
 
@@ -508,6 +603,7 @@ function makeCreatePayment({ getCore, HttpsError }) {
       return await core.createPayment({
         uid: request.auth && request.auth.uid,
         orderIds: request.data && request.data.orderIds,
+        deliveryRequestId: request.data && request.data.deliveryRequestId,
       });
     } catch (e) {
       throw toHttpsError(e);

@@ -3,7 +3,7 @@
   "private": true,
   "engines": { "node": "24.x" },
   "scripts": {
-    "test": "node test/paymentCore.test.js && node test/handlers.test.js && node sms/test/otpCore.test.js && node sms/test/handlers.test.js && node sms/test/bbg.test.js && node test/adapter.test.js"
+    "test": "node test/paymentCore.test.js && node test/handlers.test.js && node sms/test/otpCore.test.js && node sms/test/handlers.test.js && node sms/test/bbg.test.js && node test/adapter.test.js && node test/horuspay.test.js && node test/deliveryPayment.test.js"
   },
   "dependencies": {
     "firebase-admin": "^12.6.0"

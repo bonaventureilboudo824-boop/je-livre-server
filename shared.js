@@ -831,7 +831,7 @@ module.exports = function createHorusPayProvider({ token }) {
         },
       });
       if (!data || !data.payment_url || data.id == null) {
-        throw new Error('Réponse HorusPay incomplète (pas de lien de paiement).');
+        throw new Error('Réponse HorusPay incomplète (pas de lien de paiement) — reçu : ' + JSON.stringify(data));
       }
       return { paymentUrl: data.payment_url, providerRef: String(data.id) };
     },

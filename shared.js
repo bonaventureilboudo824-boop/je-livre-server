@@ -316,7 +316,7 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       });
     } catch (e) {
       await db.ref('payments/' + txId).update({
-        status: 'failed_to_create', error: String(e && e.message).slice(0, 200), failedAt: now(),
+        status: 'failed_to_create', error: String(e && e.message).slice(0, 1000), failedAt: now(),
       });
       throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
     }
@@ -378,7 +378,7 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       });
     } catch (e) {
       await db.ref('payments/' + txId).update({
-        status: 'failed_to_create', error: String(e && e.message).slice(0, 200), failedAt: now(),
+        status: 'failed_to_create', error: String(e && e.message).slice(0, 1000), failedAt: now(),
       });
       throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
     }

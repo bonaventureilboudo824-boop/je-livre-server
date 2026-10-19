@@ -763,6 +763,11 @@ const STATUS_MAP = {
   pending: 'pending',
 };
 
+function syntheticEmail(phone) {
+  const digits = String(phone || '').replace(/\D/g, '') || 'client';
+  return digits + '@client.jelivre.africa';
+}
+
 module.exports = function createHorusPayProvider({ token }) {
   async function apiCall(path, { method = 'GET', body } = {}) {
     if (!token) throw new Error('HORUSPAY_SECRET_KEY manquant.');
@@ -811,8 +816,16 @@ module.exports = function createHorusPayProvider({ token }) {
           // merchant_reference sert à ça.
           merchant_reference: txId,
           custom_metadata: { txId },
+          // HorusPay exige en pratique firstname/lastname/email (malgré leur
+          // documentation qui les présente comme facultatifs) — l'app Je
+          // Livre ne les demande jamais aux clients, donc on génère ici de
+          // quoi satisfaire leur validation, sans jamais prétendre connaître
+          // la vraie identité du client.
           customer: {
             country_code: 'BF',
+            firstname: 'Client',
+            lastname: 'Je Livre',
+            email: syntheticEmail(customer && customer.phone),
             phone: customer && customer.phone ? { number: customer.phone, country: 'bf' } : undefined,
           },
         },

@@ -806,7 +806,7 @@ module.exports = function createHorusPayProvider({ token }) {
     name: 'horuspay',
 
     async createCheckout({ txId, amount, currency, customer, returnUrl }) {
-      const data = await apiCall('/accounts/transactions', {
+      const createData = await apiCall('/accounts/transactions', {
         method: 'POST',
         body: {
           amount: Math.round(amount * 100), // unités mineures (centimes), même pour le XOF
@@ -834,11 +834,19 @@ module.exports = function createHorusPayProvider({ token }) {
       // La vraie réponse enveloppe tout dans "transaction" (contrairement à
       // la documentation HorusPay, qui montre un objet à plat) — on lit à
       // l'intérieur si c'est le cas, sinon on suppose un objet déjà à plat.
-      const t = (data && data.transaction) || data;
-      if (!t || !t.payment_url || t.id == null) {
-        throw new Error('Réponse HorusPay incomplète (pas de lien de paiement) — reçu : ' + JSON.stringify(data));
+      const created = (createData && createData.transaction) || createData;
+      if (!created || created.id == null) {
+        throw new Error("Réponse HorusPay incomplète à la création (pas d'identifiant) — reçu : " + JSON.stringify(createData));
       }
-      return { paymentUrl: t.payment_url, providerRef: String(t.id) };
+      // La création seule ne fournit PAS de lien de paiement (malgré ce que
+      // dit leur documentation) : un second appel est nécessaire pour
+      // réellement l'obtenir.
+      const tokenData = await apiCall('/accounts/transactions/' + created.id + '/generate_token', { method: 'POST' });
+      const t = (tokenData && tokenData.transaction) || tokenData;
+      if (!t || !t.payment_url) {
+        throw new Error('Réponse HorusPay incomplète (génération du lien de paiement) — reçu : ' + JSON.stringify(tokenData));
+      }
+      return { paymentUrl: t.payment_url, providerRef: String(created.id) };
     },
 
     // Ne fait JAMAIS confiance au contenu du webhook : redemande toujours
@@ -857,9 +865,14 @@ module.exports = function createHorusPayProvider({ token }) {
 
     // Extrait NOTRE identifiant de paiement du contenu envoyé par HorusPay
     // (le corps est la transaction elle-même, sérialisée en JSON).
+    // Observé en pratique : merchant_reference n'apparaît pas du tout dans la
+    // transaction renvoyée (malgré la documentation) ; custom_metadata, lui,
+    // revient bien, mais avec ses clés renommées en snake_case ("txId" devient
+    // "tx_id") — on vérifie donc les deux formes, par prudence.
     parseWebhook(req) {
       const body = req.body || {};
-      const txId = body.merchant_reference || (body.custom_metadata && body.custom_metadata.txId);
+      const meta = body.custom_metadata || {};
+      const txId = body.merchant_reference || meta.tx_id || meta.txId;
       return { txId };
     },
   };

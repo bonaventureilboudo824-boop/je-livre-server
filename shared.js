@@ -787,7 +787,11 @@ module.exports = function createHorusPayProvider({ token }) {
       throw new Error('Réponse HorusPay illisible (HTTP ' + res.status + ').');
     }
     if (!res.ok) {
-      throw new Error((json && json.message) || ('Échec HorusPay (HTTP ' + res.status + ').'));
+      // Détail complet (code HTTP + corps exact renvoyé par HorusPay) gardé
+      // dans le message — il atterrit directement dans payments/<txId>/error,
+      // visible depuis Firebase, pour diagnostiquer sans fouiller les journaux.
+      const detail = (json && JSON.stringify(json)) || '(réponse vide)';
+      throw new Error('HTTP ' + res.status + ' — ' + detail);
     }
     return json;
   }

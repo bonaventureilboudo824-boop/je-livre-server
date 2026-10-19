@@ -761,6 +761,7 @@ const STATUS_MAP = {
   expired: 'failed',
   refunded: 'failed', // remboursé : ne doit plus compter comme payé chez nous
   pending: 'pending',
+  create: 'pending', // statut initial réel observé (la documentation HorusPay annonce "pending", la vraie API renvoie "create")
 };
 
 function syntheticEmail(phone) {
@@ -830,10 +831,14 @@ module.exports = function createHorusPayProvider({ token }) {
           },
         },
       });
-      if (!data || !data.payment_url || data.id == null) {
+      // La vraie réponse enveloppe tout dans "transaction" (contrairement à
+      // la documentation HorusPay, qui montre un objet à plat) — on lit à
+      // l'intérieur si c'est le cas, sinon on suppose un objet déjà à plat.
+      const t = (data && data.transaction) || data;
+      if (!t || !t.payment_url || t.id == null) {
         throw new Error('Réponse HorusPay incomplète (pas de lien de paiement) — reçu : ' + JSON.stringify(data));
       }
-      return { paymentUrl: data.payment_url, providerRef: String(data.id) };
+      return { paymentUrl: t.payment_url, providerRef: String(t.id) };
     },
 
     // Ne fait JAMAIS confiance au contenu du webhook : redemande toujours
@@ -841,11 +846,12 @@ module.exports = function createHorusPayProvider({ token }) {
     async verifyTransaction({ providerRef }) {
       if (!providerRef) return { status: 'pending' };
       const data = await apiCall('/accounts/transactions/' + providerRef);
-      const status = STATUS_MAP[data.status] || 'pending';
+      const t = (data && data.transaction) || data;
+      const status = STATUS_MAP[t.status] || 'pending';
       return {
         status,
-        amount: typeof data.amount === 'number' ? data.amount / 100 : undefined,
-        currency: data.currency,
+        amount: typeof t.amount === 'number' ? t.amount / 100 : undefined,
+        currency: t.currency,
       };
     },
 

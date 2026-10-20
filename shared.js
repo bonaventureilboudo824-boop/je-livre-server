@@ -272,7 +272,12 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       const o = await readVal('marketplaceOrders/' + id);
       if (!o) throw new PaymentError('not-found', 'Commande introuvable : ' + id);
       if (o.clientUid !== uid) throw new PaymentError('permission-denied', "Cette commande n'est pas la vôtre.");
-      if (o.paymentMethod !== 'online') throw new PaymentError('failed-precondition', 'Cette commande se règle à la livraison.');
+      // "online" : payée d'avance au moment de la commande.
+      // "pay_on_delivery" : réglée en Mobile Money au moment de la remise,
+      // déclenché par le livreur une fois arrivé (voir completeCurrentCourse).
+      if (o.paymentMethod !== 'online' && o.paymentMethod !== 'pay_on_delivery') {
+        throw new PaymentError('failed-precondition', 'Cette commande ne peut pas être payée en ligne.');
+      }
       if (o.paymentStatus === 'paid') throw new PaymentError('already-exists', 'Cette commande est déjà payée.');
       if (o.status !== 'awaiting_payment') throw new PaymentError('failed-precondition', "Cette commande n'attend plus de paiement.");
       orders.push({ id, order: o });
@@ -404,6 +409,41 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
 
   // Appelée quand le prestataire signale un changement (webhook), et par le
   // retour du client : elle est sans danger d'être appelée plusieurs fois.
+  const REFERRAL_VALID_MS = 2 * 365 * 24 * 60 * 60 * 1000; // 2 ans — même règle que côté app
+
+  // Effets normalement posés par le client lui-même (confirmOrderReceipt),
+  // reproduits ici car pour une commande payée à la remise, le client ne les
+  // posera jamais : le paiement EST la confirmation. Mêmes montants/règles
+  // que côté app, pour que la boutique/le parrain/le livreur touchent
+  // exactement la même chose quel que soit le mode de paiement.
+  async function applyOrderCompletionSideEffects(o) {
+    if (o.shopReferredBy && !(o.shopReferredAt && now() - o.shopReferredAt > REFERRAL_VALID_MS)) {
+      await db.ref('users/' + o.shopReferredBy).transaction((cur) => {
+        cur = cur || {};
+        return { ...cur, referralBalance: (cur.referralBalance || 0) + 25, referralCount: (cur.referralCount || 0) + 1 };
+      });
+      await db.ref('platformStats').transaction((cur) => {
+        cur = cur || {};
+        return { ...cur, referralPayouts: (cur.referralPayouts || 0) + 25 };
+      });
+    }
+    const commission = Math.round((o.deliveryFee || 0) * 0.10);
+    if (commission > 0) {
+      await db.ref('platformStats').transaction((cur) => {
+        cur = cur || {};
+        return { ...cur, commissionSimple: (cur.commissionSimple || 0) + commission };
+      });
+    }
+    if (o.assignedDriverId && (o.deliveryFee || 0) > 0) {
+      // Le livreur n'a rien encaissé (le client a payé la plateforme
+      // directement) : on lui crédite les frais de livraison en intégralité.
+      await db.ref('drivers/' + o.assignedDriverId).transaction((cur) => {
+        cur = cur || {};
+        return { ...cur, earningsBalance: (cur.earningsBalance || 0) + o.deliveryFee };
+      });
+    }
+  }
+
   async function settlePayment(txId) {
     if (typeof txId !== 'string' || !TX_ID_RE.test(txId)) return { ok: false, reason: 'invalid-tx' };
     const payRef = db.ref('payments/' + txId);
@@ -443,6 +483,7 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       // la demande de livraison, selon le type de ce paiement.
       const updates = {};
       const problems = [];
+      const payAtDeliveryOrders = []; // commandes marketplace à clôturer avec leurs effets, après l'update principal
       if (pay.kind === 'delivery') {
         const r = await readVal('deliveryRequests/' + pay.requestId);
         if (r && r.status === 'awaiting_payment' && r.paymentStatus !== 'paid' && r.clientUid === pay.clientUid) {
@@ -457,10 +498,21 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
         for (const id of pay.orderIds) {
           const o = await readVal('marketplaceOrders/' + id);
           if (o && o.status === 'awaiting_payment' && o.paymentStatus !== 'paid' && o.clientUid === pay.clientUid) {
-            updates['marketplaceOrders/' + id + '/status'] = 'pending_seller';
+            // Un livreur déjà assigné à ce stade = paiement déclenché à la
+            // remise (le livreur attendait ce paiement pour pouvoir repartir),
+            // pas un pré-paiement à la commande. Le paiement EST alors la
+            // confirmation de réception : on clôture directement, et on pose
+            // ici les effets que le client aurait posés lui-même via
+            // confirmOrderReceipt (lui ne les posera jamais, pour ce mode).
+            const isPayAtDelivery = !!o.assignedDriverId;
+            updates['marketplaceOrders/' + id + '/status'] = isPayAtDelivery ? 'completed' : 'pending_seller';
             updates['marketplaceOrders/' + id + '/paymentStatus'] = 'paid';
             updates['marketplaceOrders/' + id + '/paidAt'] = now();
             updates['marketplaceOrders/' + id + '/paymentTxId'] = txId;
+            if (isPayAtDelivery) {
+              updates['marketplaceOrders/' + id + '/receivedAt'] = now();
+              payAtDeliveryOrders.push(o);
+            }
           } else {
             // Commande annulée entre-temps, ou déjà payée par une autre tentative :
             // l'argent est bien arrivé mais ne correspond plus à rien de payable.
@@ -474,6 +526,9 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       updates['payments/' + txId + '/verifiedAmount'] = Number(verified.amount);
       if (problems.length) updates['payments/' + txId + '/problemOrders'] = problems;
       await db.ref().update(updates);
+      for (const o of payAtDeliveryOrders) {
+        await applyOrderCompletionSideEffects(o);
+      }
       return { ok: true, paid: true, needsReview: problems.length > 0, status: finalStatus };
     } finally {
       try { await payRef.child('lock').set(null); } catch (e) { /* ignoré */ }

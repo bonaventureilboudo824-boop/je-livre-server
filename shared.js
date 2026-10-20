@@ -442,6 +442,16 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
         return { ...cur, earningsBalance: (cur.earningsBalance || 0) + o.deliveryFee };
       });
     }
+    // Comptage des achats par produit (même signal que côté app, pour le
+    // classement des articles) — même mécanisme pour un paiement à la remise.
+    for (const it of o.items || []) {
+      if (!it.pid) continue;
+      const qty = it.qty || 1;
+      await db.ref('productStats/' + it.pid).transaction((cur) => {
+        cur = cur || {};
+        return { ...cur, purchaseCount: (cur.purchaseCount || 0) + qty };
+      });
+    }
   }
 
   async function settlePayment(txId) {

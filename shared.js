@@ -134,6 +134,7 @@ __define('paymentGetCore', function (module, exports, require) {
 
 const { getAdmin } = __require('firebaseAdmin');
 const { createPaymentCore } = __require('paymentCore');
+const { createPayoutCore } = __require('payoutCore');
 const { getProvider } = __require('paymentProviders');
 
 function serverBaseUrl() {
@@ -155,7 +156,18 @@ function getPaymentCore() {
   return { core: createPaymentCore({ db, provider, providerName, urls }), provider, providerName };
 }
 
-module.exports = { getPaymentCore, serverBaseUrl };
+function getPayoutCore() {
+  // Les virements sortants passent toujours par le vrai prestataire HorusPay
+  // (il n'existe pas de simulation pour l'argent qui sort) — indépendant du
+  // réglage PAYMENT_PROVIDER, qui ne concerne que l'encaissement.
+  const admin = getAdmin();
+  const db = admin.database();
+  const createHorusPayProvider = __require('paymentProviderHoruspay');
+  const provider = createHorusPayProvider({ token: process.env.HORUSPAY_SECRET_KEY });
+  return { core: createPayoutCore({ db, provider }) };
+}
+
+module.exports = { getPaymentCore, getPayoutCore, serverBaseUrl };
 
 });
 
@@ -653,6 +665,108 @@ module.exports = { makeCreatePayment, makeWebhook, makeMockPay };
 
 });
 
+// ---------- lib/payoutCore.js ----------
+__define('payoutCore', function (module, exports, require) {
+'use strict';
+
+// Virements aux livreurs (retrait de leurs gains) — toujours déclenché par un
+// administrateur, jamais directement par le livreur lui-même. Le montant et
+// le droit de retrait sont systématiquement revérifiés ici, jamais pris tel
+// quel depuis ce que le client a envoyé.
+
+const { PaymentError } = __require('amounts');
+
+const MIN_PAYOUT = 100; // minimum HorusPay documenté pour un virement
+const VALID_MODES = ['moov_bf', 'orange_bf_direct']; // Burkina Faso (voir docs HorusPay > Méthodes de paiement)
+
+function createPayoutCore({ db, provider, now = () => Date.now() }) {
+  async function readVal(path) {
+    const snap = await db.ref(path).once('value');
+    return snap.val();
+  }
+
+  async function createDriverPayout({ adminUid, withdrawalId }) {
+    if (!adminUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    const isAdmin = await readVal('adminUsers/' + adminUid);
+    if (!isAdmin) throw new PaymentError('permission-denied', 'Réservé aux administrateurs.');
+
+    if (typeof withdrawalId !== 'string' || !/^w_[a-z0-9]{3,40}$/.test(withdrawalId)) {
+      throw new PaymentError('invalid-argument', 'Identifiant de demande invalide.');
+    }
+    const w = await readVal('withdrawalRequests/' + withdrawalId);
+    if (!w) throw new PaymentError('not-found', 'Demande de retrait introuvable.');
+    if (w.kind !== 'driver') throw new PaymentError('failed-precondition', "Cette demande n'est pas un retrait de livreur.");
+    if (w.status !== 'pending') throw new PaymentError('already-exists', 'Cette demande a déjà été traitée.');
+    if (!VALID_MODES.includes(w.network)) throw new PaymentError('invalid-argument', 'Réseau Mobile Money invalide.');
+    if (!Number.isInteger(w.amount) || w.amount < MIN_PAYOUT) {
+      throw new PaymentError('failed-precondition', 'Montant de retrait invalide (minimum ' + MIN_PAYOUT + ' F).');
+    }
+
+    const driver = await readVal('drivers/' + w.driverId);
+    const available = (driver && driver.earningsBalance) || 0;
+    if (w.amount > available) {
+      throw new PaymentError('failed-precondition', 'Le montant dépasse le solde disponible du livreur (' + available + ' F).');
+    }
+
+    let payout;
+    try {
+      payout = await provider.createPayout({ amount: w.amount, currency: 'XOF', mode: w.network, phone: w.phone });
+    } catch (e) {
+      await db.ref('withdrawalRequests/' + withdrawalId).update({
+        lastError: String(e && e.message).slice(0, 1000), lastErrorAt: now(),
+      });
+      throw new PaymentError('unavailable', "Le virement n'a pas pu être initié. Réessayez dans un instant.");
+    }
+
+    const updates = {};
+    updates['withdrawalRequests/' + withdrawalId + '/status'] = 'processing';
+    updates['withdrawalRequests/' + withdrawalId + '/payoutId'] = payout.payoutId;
+    updates['withdrawalRequests/' + withdrawalId + '/fees'] = payout.fees;
+    updates['withdrawalRequests/' + withdrawalId + '/netAmount'] = payout.netAmount;
+    updates['withdrawalRequests/' + withdrawalId + '/processedBy'] = adminUid;
+    updates['withdrawalRequests/' + withdrawalId + '/processedAt'] = now();
+    updates['drivers/' + w.driverId + '/earningsBalance'] = Math.max(0, available - w.amount);
+    await db.ref().update(updates);
+
+    return { ok: true, payoutId: payout.payoutId, fees: payout.fees, netAmount: payout.netAmount };
+  }
+
+  return { createDriverPayout };
+}
+
+module.exports = { createPayoutCore };
+
+});
+
+// ---------- lib/payoutHandlers.js ----------
+__define('payoutHandlers', function (module, exports, require) {
+'use strict';
+
+const { PaymentError } = __require('amounts');
+
+function makeCreateDriverPayout({ getCore, HttpsError }) {
+  const toHttpsError = (e) => {
+    if (e instanceof PaymentError) return new HttpsError(e.code, e.message);
+    console.error('[virement] erreur inattendue', e);
+    return new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+  };
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.createDriverPayout({
+        adminUid: request.auth && request.auth.uid,
+        withdrawalId: request.data && request.data.withdrawalId,
+      });
+    } catch (e) {
+      throw toHttpsError(e);
+    }
+  };
+}
+
+module.exports = { makeCreateDriverPayout };
+
+});
+
 // ---------- providers/index.js ----------
 __define('paymentProviders', function (module, exports, require) {
 'use strict';
@@ -878,6 +992,46 @@ module.exports = function createHorusPayProvider({ token }) {
       const meta = body.custom_metadata || {};
       const txId = body.merchant_reference || meta.tx_id || meta.txId;
       return { txId };
+    },
+
+    // Virement sortant (argent envoyé vers le Mobile Money d'un livreur).
+    // Même schéma en deux appels que pour les collectes (créer, puis
+    // déclencher) — et par prudence, on applique la même leçon apprise avec
+    // les collectes : AUCUNE conversion ×100, même si leur documentation
+    // utilise la même formulation ambiguë (« plus petite unité monétaire »)
+    // qui s'est révélée fausse pour le XOF à l'usage. À reconfirmer avec un
+    // tout petit retrait réel avant de faire confiance à grande échelle.
+    async createPayout({ amount, currency, mode, phone }) {
+      const createData = await apiCall('/accounts/payouts', {
+        method: 'POST',
+        body: {
+          amount: Math.round(amount),
+          currency,
+          mode,
+          customer: {
+            firstname: 'Livreur',
+            lastname: 'Je Livre',
+            email: syntheticEmail(phone),
+            country_code: 'BF',
+            phone: { number: phone, country: 'bf', network: mode },
+          },
+        },
+      });
+      // Leur documentation enveloppe la réponse dans "data" ici (pas
+      // "transaction" comme pour les collectes) — on reste défensif, comme
+      // partout ailleurs dans ce fichier, au cas où la réalité diffère encore.
+      const created = (createData && createData.data) || createData;
+      if (!created || created.id == null) {
+        throw new Error('Réponse HorusPay incomplète à la création du virement — reçu : ' + JSON.stringify(createData));
+      }
+      const execData = await apiCall('/accounts/payouts/' + created.id + '/execute', { method: 'POST' });
+      const executed = (execData && execData.data) || execData || {};
+      return {
+        payoutId: String(created.id),
+        status: executed.status || created.status || 'processing',
+        fees: typeof created.fees === 'number' ? created.fees : 0,
+        netAmount: typeof created.net_amount === 'number' ? created.net_amount : amount,
+      };
     },
   };
 };
@@ -1289,6 +1443,7 @@ module.exports = function createBbgProvider({ token, senderId }) {
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
+const payoutHandlers = __require('payoutHandlers');
 const smsGetCore = __require('smsGetCore');
 const otpHandlers = __require('otpHandlers');
 
@@ -1299,6 +1454,8 @@ module.exports = {
   makeCreatePayment: paymentHandlers.makeCreatePayment,
   makeWebhook: paymentHandlers.makeWebhook,
   makeMockPay: paymentHandlers.makeMockPay,
+  getPayoutCore: paymentGetCore.getPayoutCore,
+  makeCreateDriverPayout: payoutHandlers.makeCreateDriverPayout,
   getOtpCore: smsGetCore.getOtpCore,
   makeRequestOtp: otpHandlers.makeRequestOtp,
   makeVerifyOtp: otpHandlers.makeVerifyOtp,

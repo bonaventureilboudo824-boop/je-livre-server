@@ -573,7 +573,10 @@ function computeDeliveryRequestAmount({ request }) {
   if (!s || !isNum(s.lat) || !isNum(s.lng) || !r || !isNum(r.lat) || !isNum(r.lng)) {
     throw new PaymentError('failed-precondition', 'Position du destinataire manquante : paiement en ligne indisponible pour cette demande.');
   }
-  const distanceKm = haversineKm(s.lat, s.lng, r.lat, r.lng);
+  // × 1,3 : même facteur que côté app (window.GeoUtils dans je-livre-prototype.html),
+  // pour que le montant facturé ne puisse jamais différer de ce qui a été
+  // affiché au client avant qu'il ne confirme.
+  const distanceKm = haversineKm(s.lat, s.lng, r.lat, r.lng) * 1.3;
   const price = deliveryFeeForKm(distanceKm);
   return { distanceKm, price };
 }

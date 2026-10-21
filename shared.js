@@ -55,16 +55,24 @@ const STATUS_BY_CODE = {
   'internal': 500,
 };
 
-// Origine(s) autorisées à appeler ce serveur (votre site GitHub Pages).
-// Réglable sans toucher au code via la variable d'environnement ALLOWED_ORIGIN
-// (voir .env.example) — "*" par défaut (tout le monde), à resserrer une fois
-// votre adresse GitHub Pages connue.
-function allowedOrigin() {
-  return process.env.ALLOWED_ORIGIN || '*';
+// Origine(s) autorisées à appeler ce serveur. Réglable sans toucher au code
+// via la variable d'environnement ALLOWED_ORIGIN (voir .env.example) —
+// "*" par défaut (tout le monde). Peut contenir plusieurs adresses séparées
+// par une virgule (ex. le domaine personnalisé ET l'adresse GitHub Pages,
+// utile tant que les deux servent l'app) : seule celle qui correspond
+// vraiment à la requête en cours est renvoyée, jamais la liste entière.
+function allowedOrigin(req) {
+  const setting = process.env.ALLOWED_ORIGIN || '*';
+  if (setting === '*') return '*';
+  const list = setting.split(',').map((s) => s.trim()).filter(Boolean);
+  const requestOrigin = req && req.headers && req.headers.origin;
+  if (requestOrigin && list.includes(requestOrigin)) return requestOrigin;
+  return list[0] || '*'; // repli : la première adresse déclarée, jamais un accès total par défaut
 }
 
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', allowedOrigin());
+function setCors(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin(req));
+  res.setHeader('Vary', 'Origin'); // pour que les caches ne mélangent pas les réponses entre origines différentes
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
@@ -92,7 +100,7 @@ async function verifyAuth(req) {
 function wrapCallable(makeHandler, getCore) {
   const handler = makeHandler({ getCore, HttpsError: ApiError });
   return async (req, res) => {
-    setCors(res);
+    setCors(req, res);
     if (req.method === 'OPTIONS') { res.status(204).end(); return; }
     if (req.method !== 'POST') { res.status(405).json({ code: 'invalid-argument', message: 'Méthode non autorisée.' }); return; }
     try {
@@ -115,7 +123,7 @@ function wrapCallable(makeHandler, getCore) {
 function wrapRaw(makeHandler, getCore) {
   const handler = makeHandler({ getCore });
   return async (req, res) => {
-    setCors(res);
+    setCors(req, res);
     if (req.method === 'OPTIONS') { res.status(204).end(); return; }
     await handler(req, res);
   };

@@ -1,20 +1,6 @@
-
 name: Deployer les regles Firebase
-
-# Etape 1 : declenchement MANUEL seulement (bouton "Run workflow" dans l'onglet Actions).
-# Quand vous avez verifie que les regles du depot sont identiques a celles de la console Firebase,
-# remplacez le bloc "on:" ci-dessous par le bloc commente (lignes avec #) pour un deploiement
-# automatique a chaque modification des regles.
 on:
   workflow_dispatch:
-#on:
-#  push:
-#    branches: [main]
-#    paths:
-#      - 'database.rules.json'
-#      - 'firebase.json'
-#  workflow_dispatch:
-
 jobs:
   deploy:
     runs-on: ubuntu-latest

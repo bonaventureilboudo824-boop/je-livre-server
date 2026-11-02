@@ -1,0 +1,371 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "users": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        "referralBalance": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (newData.val() === data.val() || (!data.exists() && newData.val() === 0)))"
+        },
+        "referralCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (newData.val() === data.val() || (!data.exists() && newData.val() === 0)))"
+        },
+        "referredBy": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val() !== $uid && root.child('users').child(newData.val()).exists() && (!data.exists() || data.val() === newData.val() || root.child('adminUsers').child(auth.uid).exists()))"
+        },
+        "referredAt": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || data.val() === newData.val() || root.child('adminUsers').child(auth.uid).exists()))"
+        }
+      }
+    },
+    "referralCodes": {
+      ".read": true,
+      "$code": {
+        ".write": "auth != null && !data.exists() && newData.val() === auth.uid"
+      }
+    },
+    "adminUsers": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).child('roles').child('0').val() === 'super_admin' || root.child('adminUsers').child(auth.uid).child('roles').child('1').val() === 'super_admin' || root.child('adminUsers').child(auth.uid).child('roles').child('2').val() === 'super_admin' || root.child('adminUsers').child(auth.uid).child('role').val() === 'super_admin')"
+      }
+    },
+    "drivers": {
+      ".read": "auth != null",
+      ".indexOn": [
+        "enterpriseId"
+      ],
+      "$driverId": {
+        ".write": "auth != null && (auth.uid === $driverId || root.child('adminUsers').child(auth.uid).exists() || data.child('enterpriseId').val() === auth.uid)",
+        "lat": {
+          ".validate": "newData.isNumber() && newData.val() >= -90 && newData.val() <= 90"
+        },
+        "lng": {
+          ".validate": "newData.isNumber() && newData.val() >= -180 && newData.val() <= 180"
+        },
+        "status": {
+          ".validate": "newData.val() === 'pending' || newData.val() === 'approved' || newData.val() === 'rejected'"
+        },
+        "online": {
+          ".validate": "newData.isBoolean()"
+        },
+        "pendingCommission": {
+          ".validate": "root.child('adminUsers').child(auth.uid).exists() || !data.exists() || newData.val() >= data.val()"
+        },
+        "earningsBalance": {
+          ".validate": "!data.exists() || newData.val() >= data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        }
+      }
+    },
+    "deliveryRequests": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'status' && query.equalTo == 'pending') || (query.orderByChild == 'assignedDriverId' && query.equalTo == auth.uid) || (query.orderByChild == 'assignedDriverId' && root.child('drivers').child(query.equalTo).child('enterpriseId').val() == auth.uid) || (query.orderByChild == 'clientUid' && query.equalTo == auth.uid))",
+      ".indexOn": [
+        "assignedDriverId",
+        "status",
+        "clientUid"
+      ],
+      "$requestId": {
+        ".read": "auth != null && (data.child('status').val() === 'pending' || data.child('clientUid').val() === auth.uid || data.child('assignedDriverId').val() === auth.uid)",
+        ".write": "auth != null && ((!data.exists() && newData.child('clientUid').val() === auth.uid) || (data.exists() && data.child('clientUid').val() === auth.uid) || (data.exists() && data.child('assignedDriverId').val() === auth.uid) || (data.exists() && !data.child('assignedDriverId').exists() && newData.child('assignedDriverId').val() === auth.uid) || root.child('adminUsers').child(auth.uid).exists())",
+        "clientUid": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "assignedDriverId": {
+          ".validate": "newData.val() === data.val() || (newData.val() === auth.uid && root.child('drivers').child(auth.uid).exists()) || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "price": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "distanceKm": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentMethod": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentStatus": {
+          ".validate": "newData.val() === data.val() || newData.val() !== 'paid' || newData.parent().child('paymentMethod').val() === 'cash' || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "status": {
+          ".validate": "(data.exists() || newData.parent().child('paymentMethod').val() !== 'online' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()) && (data.val() !== 'awaiting_payment' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists())"
+        }
+      }
+    },
+    "marketplaceOrders": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'status' && query.equalTo == 'pending_delivery') || (query.orderByChild == 'shopId' && query.equalTo == auth.uid) || (query.orderByChild == 'clientUid' && query.equalTo == auth.uid) || (query.orderByChild == 'assignedDriverId' && query.equalTo == auth.uid) || (query.orderByChild == 'assignedDriverId' && root.child('drivers').child(query.equalTo).child('enterpriseId').val() == auth.uid))",
+      ".indexOn": [
+        "assignedDriverId",
+        "status",
+        "clientUid",
+        "shopId"
+      ],
+      "$orderId": {
+        ".read": "auth != null && (data.child('status').val() === 'pending_delivery' || data.child('clientUid').val() === auth.uid || data.child('assignedDriverId').val() === auth.uid || data.child('shopId').val() === auth.uid)",
+        ".write": "auth != null && ((!data.exists() && newData.child('clientUid').val() === auth.uid) || (data.exists() && data.child('clientUid').val() === auth.uid) || (data.exists() && data.child('shopId').val() === auth.uid) || (data.exists() && data.child('assignedDriverId').val() === auth.uid) || (data.exists() && !data.child('assignedDriverId').exists() && newData.child('assignedDriverId').val() === auth.uid) || root.child('adminUsers').child(auth.uid).exists())",
+        "subtotal": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "deliveryFee": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "total": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "shopId": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentMethod": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentStatus": {
+          ".validate": "newData.val() === data.val() || newData.val() !== 'paid' || newData.parent().child('paymentMethod').val() === 'cash' || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "status": {
+          ".validate": "(data.exists() || newData.parent().child('paymentMethod').val() !== 'online' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()) && (data.val() !== 'awaiting_payment' || newData.val() === 'awaiting_payment' || newData.val() === 'cancelled' || root.child('adminUsers').child(auth.uid).exists()) && (newData.val() !== 'cancelled' || newData.parent().child('paymentMethod').val() !== 'online' || newData.parent().child('paymentStatus').val() !== 'paid' || root.child('adminUsers').child(auth.uid).exists())"
+        },
+        "clientUid": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "assignedDriverId": {
+          ".validate": "newData.val() === data.val() || (newData.val() === auth.uid && root.child('drivers').child(auth.uid).exists()) || root.child('adminUsers').child(auth.uid).exists()"
+        }
+      }
+    },
+    "enterprises": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$entId": {
+        ".read": "auth != null && auth.uid === $entId",
+        ".write": "auth != null && (auth.uid === $entId || root.child('adminUsers').child(auth.uid).exists())"
+      }
+    },
+    "shops": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'approved' && query.equalTo == true))",
+      ".indexOn": [
+        "approved"
+      ],
+      "$shopId": {
+        ".read": "auth != null && (data.child('approved').val() === true || auth.uid === $shopId)",
+        ".write": "auth != null && (auth.uid === $shopId || root.child('adminUsers').child(auth.uid).exists())",
+        "referredBy": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val() !== $shopId && root.child('users').child(newData.val()).exists() && (!data.exists() || data.val() === newData.val() || data.parent().child('approved').val() !== true || root.child('adminUsers').child(auth.uid).exists()))"
+        },
+        "referredAt": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || data.val() === newData.val() || data.parent().child('approved').val() !== true || root.child('adminUsers').child(auth.uid).exists()))"
+        }
+      }
+    },
+    "products": {
+      ".read": "auth != null",
+      ".indexOn": [
+        "shopId"
+      ],
+      "$productId": {
+        ".write": "auth != null && (newData.child('shopId').val() === auth.uid || data.child('shopId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())"
+      }
+    },
+    "registrations": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$regId": {
+        ".read": "auth != null && auth.uid === $regId",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || !data.exists())",
+        ".validate": "newData.hasChildren(['type', 'status']) && (root.child('adminUsers').child(auth.uid).exists() || newData.child('status').val() === 'pending')"
+      }
+    },
+    "supportTickets": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$ticketId": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "messages": {
+          "$msgId": {
+            "text": {
+              ".validate": "newData.isString() && newData.val().length <= 2000"
+            }
+          }
+        }
+      }
+    },
+    "notifications": {
+      ".read": "auth != null",
+      "$notifId": {
+        ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
+      }
+    },
+    "ads": {
+      ".read": "auth != null",
+      "$adId": {
+        ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
+      }
+    },
+    "locationRequests": {
+      "$reqId": {
+        ".read": "auth != null",
+        ".write": "$reqId.matches(/^req_[a-z0-9]+$/) && !data.exists() && newData.exists()",
+        ".validate": "newData.hasChildren(['lat', 'lng'])",
+        "lat": {
+          ".validate": "newData.isNumber() && newData.val() >= -90 && newData.val() <= 90"
+        },
+        "lng": {
+          ".validate": "newData.isNumber() && newData.val() >= -180 && newData.val() <= 180"
+        }
+      }
+    },
+    "withdrawalRequests": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'shopId' && query.equalTo == auth.uid) || (query.orderByChild == 'driverId' && query.equalTo == auth.uid))",
+      ".indexOn": [
+        "shopId",
+        "driverId"
+      ],
+      "$id": {
+        ".read": "auth != null && (data.child('shopId').val() === auth.uid || data.child('clientUid').val() === auth.uid || data.child('driverId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('status').val() === 'pending' && (newData.child('shopId').val() === auth.uid || newData.child('driverId').val() === auth.uid)))",
+        ".validate": "!newData.exists() || root.child('adminUsers').child(auth.uid).exists() || (!newData.child('clientUid').exists() && !newData.child('debited').exists() && !newData.child('refunded').exists() && (!newData.child('kind').exists() || newData.child('kind').val() === 'driver'))"
+      }
+    },
+    "commissionPayments": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'driverId' && query.equalTo == auth.uid))",
+      ".indexOn": [
+        "driverId"
+      ],
+      "$id": {
+        ".read": "auth != null && (data.child('driverId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('driverId').val() === auth.uid && newData.child('status').val() === 'pending'))"
+      }
+    },
+    "platformStats": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      ".write": "auth != null"
+    },
+    "remittances": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'driverId' && query.equalTo == auth.uid))",
+      ".indexOn": [
+        "driverId"
+      ],
+      "$id": {
+        ".read": "auth != null && (data.child('driverId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('status').val() === 'owed') || (data.child('driverId').val() === auth.uid && newData.child('status').val() === 'declared'))"
+      }
+    },
+    "payments": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$txId": {
+        ".read": "auth != null && data.child('clientUid').val() === auth.uid"
+      }
+    },
+    "reels": {
+      ".read": "auth != null",
+      ".indexOn": [
+        "shopId"
+      ],
+      "$reelId": {
+        ".write": "auth != null && (newData.child('shopId').val() === auth.uid || data.child('shopId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".validate": "newData.hasChildren(['shopId', 'videoUrl', 'createdAt'])",
+        "videoUrl": {
+          ".validate": "newData.isString() && newData.val().length < 500"
+        },
+        "caption": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length < 300)"
+        }
+      }
+    },
+    "otps": {
+      ".read": false,
+      ".write": false
+    },
+    "mockSmsLog": {
+      ".read": false,
+      ".write": false
+    },
+    "reelStats": {
+      ".read": "auth != null",
+      "$reelId": {
+        ".write": "auth != null",
+        "viewCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        },
+        "productClicks": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        },
+        "commentCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        },
+        "likeCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        },
+        "watchMs": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        }
+      }
+    },
+    "productStats": {
+      ".read": "auth != null",
+      "$productKey": {
+        ".write": "auth != null",
+        "viewCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        },
+        "purchaseCount": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || newData.val() >= data.val()))"
+        }
+      }
+    },
+    "reelComments": {
+      ".read": "auth != null",
+      "$reelId": {
+        "$commentId": {
+          ".write": "auth != null && ((!data.exists() && newData.child('uid').val() === auth.uid) || root.child('adminUsers').child(auth.uid).exists())",
+          ".validate": "newData.hasChildren(['uid', 'name', 'text', 'createdAt'])",
+          "uid": {
+            ".validate": "newData.isString()"
+          },
+          "name": {
+            ".validate": "newData.isString() && newData.val().length <= 60"
+          },
+          "text": {
+            ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 300"
+          },
+          "createdAt": {
+            ".validate": "newData.val() === now || root.child('adminUsers').child(auth.uid).exists()"
+          }
+        }
+      }
+    },
+    "reelLikes": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        "$reelId": {
+          ".validate": "newData.isBoolean()"
+        }
+      }
+    },
+    "userAffinity": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "referralCredits": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
+    },
+    "driverWallets": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        "autoPay": {
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.isBoolean()"
+        }
+      }
+    },
+    "commissionLedger": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())"
+      }
+    }
+  }
+}

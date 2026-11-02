@@ -7,10 +7,16 @@
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid",
         "referralBalance": {
-          ".write": "auth != null"
+          ".validate": "!newData.exists() || (newData.isNumber() && (newData.val() === data.val() || (!data.exists() && newData.val() === 0)))"
         },
         "referralCount": {
-          ".write": "auth != null"
+          ".validate": "!newData.exists() || (newData.isNumber() && (newData.val() === data.val() || (!data.exists() && newData.val() === 0)))"
+        },
+        "referredBy": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val() !== $uid && root.child('users').child(newData.val()).exists() && (!data.exists() || data.val() === newData.val() || root.child('adminUsers').child(auth.uid).exists()))"
+        },
+        "referredAt": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || data.val() === newData.val() || root.child('adminUsers').child(auth.uid).exists()))"
         }
       }
     },
@@ -141,7 +147,13 @@
       ],
       "$shopId": {
         ".read": "auth != null && (data.child('approved').val() === true || auth.uid === $shopId)",
-        ".write": "auth != null && (auth.uid === $shopId || root.child('adminUsers').child(auth.uid).exists())"
+        ".write": "auth != null && (auth.uid === $shopId || root.child('adminUsers').child(auth.uid).exists())",
+        "referredBy": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val() !== $shopId && root.child('users').child(newData.val()).exists() && (!data.exists() || data.val() === newData.val() || data.parent().child('approved').val() !== true || root.child('adminUsers').child(auth.uid).exists()))"
+        },
+        "referredAt": {
+          ".validate": "!newData.exists() || (newData.isNumber() && (!data.exists() || data.val() === newData.val() || data.parent().child('approved').val() !== true || root.child('adminUsers').child(auth.uid).exists()))"
+        }
       }
     },
     "products": {
@@ -208,7 +220,8 @@
       ],
       "$id": {
         ".read": "auth != null && (data.child('shopId').val() === auth.uid || data.child('clientUid').val() === auth.uid || data.child('driverId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
-        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('status').val() === 'pending' && (newData.child('shopId').val() === auth.uid || newData.child('clientUid').val() === auth.uid || newData.child('driverId').val() === auth.uid)))"
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('status').val() === 'pending' && (newData.child('shopId').val() === auth.uid || newData.child('driverId').val() === auth.uid)))",
+        ".validate": "!newData.exists() || root.child('adminUsers').child(auth.uid).exists() || (!newData.child('clientUid').exists() && !newData.child('debited').exists() && !newData.child('refunded').exists() && (!newData.child('kind').exists() || newData.child('kind').val() === 'driver'))"
       }
     },
     "commissionPayments": {
@@ -333,6 +346,25 @@
       "$uid": {
         ".read": "auth != null && auth.uid === $uid",
         ".write": "auth != null && auth.uid === $uid"
+      }
+    },
+    "referralCredits": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
+    },
+    "driverWallets": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        "autoPay": {
+          ".write": "auth != null && auth.uid === $uid",
+          ".validate": "newData.isBoolean()"
+        }
+      }
+    },
+    "commissionLedger": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())"
       }
     }
   }

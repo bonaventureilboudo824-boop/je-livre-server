@@ -1,0 +1,59 @@
+name: Audit du parrainage (lecture seule)
+
+# Ne modifie RIEN : il lit les comptes et affiche un rapport dans le journal.
+# Les identifiants sont masques (6 premiers et 4 derniers caracteres) car ce depot est public.
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Installer firebase-admin
+        run: npm install --no-audit --no-fund firebase-admin@12
+      - name: Auditer les soldes de parrainage
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > audit.js <<'EOF'
+          const admin = require('firebase-admin');
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)),
+            databaseURL: 'https://je-livre-509fd-default-rtdb.europe-west1.firebasedatabase.app',
+          });
+          const mask = (u) => String(u).slice(0, 6) + '...' + String(u).slice(-4);
+          (async () => {
+            const db = admin.database();
+            const [users, shops, stats, withdrawals] = await Promise.all(['users', 'shops', 'platformStats', 'withdrawalRequests'].map(async (p) => (await db.ref(p).once('value')).val() || {}));
+            let total = 0, withBalance = 0;
+            const rows = [], suspects = [], below = [], selfRef = [];
+            for (const [uid, u] of Object.entries(users)) {
+              const b = Number(u.referralBalance || 0), c = Number(u.referralCount || 0);
+              if (b > 0) { withBalance++; total += b; rows.push([uid, b, c]); }
+              // Chaque credit ajoutait exactement 25 F et 1 au compteur : un solde SUPERIEUR a 25 x compteur ne s'explique pas.
+              if (b > 25 * c) suspects.push([uid, b, c]);
+              else if (b < 25 * c && c > 0) below.push([uid, b, c]);
+              if (u.referredBy && u.referredBy === uid) selfRef.push(uid);
+            }
+            for (const [sid, s] of Object.entries(shops)) if (s && s.referredBy === sid) selfRef.push(sid);
+            rows.sort((a, b) => b[1] - a[1]);
+            const pendingRef = Object.values(withdrawals).filter((w) => w && w.status === 'pending' && (w.kind === 'referral' || (!w.kind && w.clientUid))).length;
+            console.log('=== AUDIT DU PARRAINAGE ===');
+            console.log('Comptes avec un solde de parrainage :', withBalance, '| total des soldes :', total, 'F');
+            console.log('Total deja reverse aux parrains selon les statistiques (platformStats.referralPayouts) :', stats.referralPayouts || 0, 'F');
+            console.log('Retraits de parrainage en attente :', pendingRef);
+            console.log('\n10 plus gros soldes (identifiant masque, solde F, compteur) :');
+            rows.slice(0, 10).forEach((r) => console.log('  ', mask(r[0]), r[1], r[2]));
+            console.log('\nSOLDES SUSPECTS (solde > 25 x compteur) :', suspects.length);
+            suspects.forEach((r) => console.log('  !!', mask(r[0]), 'solde', r[1], '| compteur', r[2], '| attendu au plus', 25 * r[2]));
+            console.log('\nSoldes plus bas que prevu (retraits ou ajustements manuels : normal) :', below.length);
+            console.log('Comptes parraines par eux-memes :', selfRef.length);
+            selfRef.forEach((u) => console.log('  !!', mask(u)));
+            console.log(suspects.length || selfRef.length ? '\n=> A VERIFIER dans la console Firebase (Realtime Database, users).' : '\n=> Rien d\'anormal detecte.');
+            process.exit(0);
+          })().catch((e) => { console.error('Echec :', e.message); process.exit(1); });
+          EOF
+          node audit.js

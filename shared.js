@@ -143,6 +143,9 @@ __define('paymentGetCore', function (module, exports, require) {
 const { getAdmin } = __require('firebaseAdmin');
 const { createPaymentCore } = __require('paymentCore');
 const { createPayoutCore } = __require('payoutCore');
+const { createNotifyCore } = __require('notifyCore');
+const { createReferralCore } = __require('referralCore');
+const { createCommissionCore } = __require('commissionCore');
 const { getProvider } = __require('paymentProviders');
 
 function serverBaseUrl() {
@@ -175,7 +178,23 @@ function getPayoutCore() {
   return { core: createPayoutCore({ db, provider }) };
 }
 
-module.exports = { getPaymentCore, getPayoutCore, serverBaseUrl };
+function getNotifyCore() {
+  const admin = getAdmin();
+  const db = admin.database();
+  return { core: createNotifyCore({ db, messaging: admin.messaging() }) };
+}
+
+function getReferralCore() {
+  const admin = getAdmin();
+  return { core: createReferralCore({ db: admin.database() }) };
+}
+
+function getCommissionCore() {
+  const admin = getAdmin();
+  return { core: createCommissionCore({ db: admin.database() }) };
+}
+
+module.exports = { getPaymentCore, getPayoutCore, getNotifyCore, getReferralCore, getCommissionCore, serverBaseUrl };
 
 });
 
@@ -236,6 +255,8 @@ __define('paymentCore', function (module, exports, require) {
 //                       / paymentStatus "paid". Seul le serveur peut faire ça.
 
 const { PaymentError, computeOrderAmounts, computeDeliveryRequestAmount } = __require('amounts');
+const { createReferralCore } = __require('referralCore');
+const { createCommissionCore, TOPUP_MIN, TOPUP_MAX } = __require('commissionCore');
 
 const CURRENCY = 'XOF';
 const MIN_AMOUNT = 100;            // FCFA — la plupart des prestataires refusent en dessous
@@ -248,6 +269,8 @@ const TX_ID_RE = /^JL[A-Z0-9]{6,30}$/;
 const DELIVERY_REQUEST_ID_RE = /^dr_[a-z0-9]{3,40}$/;
 
 function createPaymentCore({ db, provider, providerName, urls, now = () => Date.now(), random = Math.random }) {
+  const referral = createReferralCore({ db, now });
+  const commission = createCommissionCore({ db, now, random });
   const readVal = async (path) => (await db.ref(path).once('value')).val();
 
   function newTxId() {
@@ -255,8 +278,48 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
     return 'JL' + now().toString(36).toUpperCase() + rand;
   }
 
-  async function createPayment({ uid, orderIds, deliveryRequestId }) {
+  // Recharge du solde de commission d'un livreur (garantie).
+  async function createCommissionTopup({ uid, amount }) {
+    if (!Number.isInteger(amount) || amount < TOPUP_MIN || amount > TOPUP_MAX) {
+      throw new PaymentError('invalid-argument', 'Montant de recharge invalide (entre ' + TOPUP_MIN + ' et ' + TOPUP_MAX + ' F).');
+    }
+    const driver = await readVal('drivers/' + uid);
+    if (!driver) throw new PaymentError('failed-precondition', 'Compte livreur introuvable.');
+    if (!driver.approved) throw new PaymentError('failed-precondition', "Votre compte livreur n'est pas encore validé.");
+    const throttle = await db.ref('paymentThrottle/' + uid).transaction(
+      (cur) => (typeof cur === 'number' && now() - cur < THROTTLE_MS ? undefined : now())
+    );
+    if (!throttle.committed) throw new PaymentError('resource-exhausted', 'Veuillez patienter quelques secondes avant de réessayer.');
+
+    const txId = newTxId();
+    await db.ref('payments/' + txId).set({
+      txId, clientUid: uid, kind: 'commissionTopup', driverId: uid, amount, currency: CURRENCY,
+      provider: providerName, status: 'initiated', createdAt: now(),
+    });
+    let checkout;
+    try {
+      checkout = await provider.createCheckout({
+        txId, amount, currency: CURRENCY,
+        description: 'Recharge commission Je Livre',
+        customer: { uid, phone: driver.phone || '' },
+        returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
+        notifyUrl: urls.webhookUrl,
+      });
+    } catch (e) {
+      await db.ref('payments/' + txId).update({ status: 'failed_to_create', error: String(e && e.message).slice(0, 1000), failedAt: now() });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    if (!checkout || !checkout.paymentUrl) {
+      await db.ref('payments/' + txId).update({ status: 'failed_to_create', error: 'no-payment-url', failedAt: now() });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    await db.ref('payments/' + txId).update({ providerRef: checkout.providerRef || null });
+    return { txId, paymentUrl: checkout.paymentUrl, amount };
+  }
+
+  async function createPayment({ uid, orderIds, deliveryRequestId, commissionTopup }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (commissionTopup != null) return createCommissionTopup({ uid, amount: commissionTopup });
     if (deliveryRequestId != null) return createDeliveryPayment({ uid, deliveryRequestId });
     if (!Array.isArray(orderIds) || orderIds.length < 1 || orderIds.length > MAX_ORDERS_PER_PAYMENT
         || new Set(orderIds).size !== orderIds.length
@@ -417,24 +480,15 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
 
   // Appelée quand le prestataire signale un changement (webhook), et par le
   // retour du client : elle est sans danger d'être appelée plusieurs fois.
-  const REFERRAL_VALID_MS = 2 * 365 * 24 * 60 * 60 * 1000; // 2 ans — même règle que côté app
-
   // Effets normalement posés par le client lui-même (confirmOrderReceipt),
   // reproduits ici car pour une commande payée à la remise, le client ne les
   // posera jamais : le paiement EST la confirmation. Mêmes montants/règles
   // que côté app, pour que la boutique/le parrain/le livreur touchent
   // exactement la même chose quel que soit le mode de paiement.
-  async function applyOrderCompletionSideEffects(o) {
-    if (o.shopReferredBy && !(o.shopReferredAt && now() - o.shopReferredAt > REFERRAL_VALID_MS)) {
-      await db.ref('users/' + o.shopReferredBy).transaction((cur) => {
-        cur = cur || {};
-        return { ...cur, referralBalance: (cur.referralBalance || 0) + 25, referralCount: (cur.referralCount || 0) + 1 };
-      });
-      await db.ref('platformStats').transaction((cur) => {
-        cur = cur || {};
-        return { ...cur, referralPayouts: (cur.referralPayouts || 0) + 25 };
-      });
-    }
+  async function applyOrderCompletionSideEffects(id, o) {
+    // Parrainage : le serveur lit lui-même le parrain dans le profil de la boutique
+    // (jamais dans la commande, que le client peut falsifier), une seule fois par commande.
+    await referral.creditMarketplaceOrder({ id, order: o });
     const commission = Math.round((o.deliveryFee || 0) * 0.10);
     if (commission > 0) {
       await db.ref('platformStats').transaction((cur) => {
@@ -497,6 +551,13 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
         return { ok: false, reason: 'amount-mismatch' };
       }
 
+      // Recharge du solde de commission d'un livreur : on crédite son solde (une seule fois).
+      if (pay.kind === 'commissionTopup') {
+        await commission.creditTopup({ txId, driverId: pay.driverId, amount: pay.amount });
+        await payRef.update({ status: 'paid', paidAt: now(), verifiedAmount: Number(verified.amount) });
+        return { ok: true, paid: true, status: 'paid' };
+      }
+
       // Argent réellement reçu et montant exact : on débloque la commande ou
       // la demande de livraison, selon le type de ce paiement.
       const updates = {};
@@ -529,7 +590,7 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
             updates['marketplaceOrders/' + id + '/paymentTxId'] = txId;
             if (isPayAtDelivery) {
               updates['marketplaceOrders/' + id + '/receivedAt'] = now();
-              payAtDeliveryOrders.push(o);
+              payAtDeliveryOrders.push({ id, o });
             }
           } else {
             // Commande annulée entre-temps, ou déjà payée par une autre tentative :
@@ -544,8 +605,8 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
       updates['payments/' + txId + '/verifiedAmount'] = Number(verified.amount);
       if (problems.length) updates['payments/' + txId + '/problemOrders'] = problems;
       await db.ref().update(updates);
-      for (const o of payAtDeliveryOrders) {
-        await applyOrderCompletionSideEffects(o);
+      for (const { id, o } of payAtDeliveryOrders) {
+        await applyOrderCompletionSideEffects(id, o);
       }
       return { ok: true, paid: true, needsReview: problems.length > 0, status: finalStatus };
     } finally {
@@ -557,6 +618,340 @@ function createPaymentCore({ db, provider, providerName, urls, now = () => Date.
 }
 
 module.exports = { createPaymentCore, PaymentError };
+
+});
+
+// ---------- lib/commissionCore.js ----------
+__define('commissionCore', function (module, exports, require) {
+'use strict';
+
+// Solde de commission (garantie) des livreurs.
+//
+// Le livreur approvisionne ce solde par un vrai paiement en ligne (vérifié par
+// le serveur, comme pour les clients). Tant qu'il couvre la commission en
+// attente, le livreur peut continuer à accepter des livraisons. Il peut s'en
+// servir pour payer sa commission (sur son autorisation). Le solde n'est
+// JAMAIS écrit par l'application : seulement ici, avec l'accès administrateur.
+
+const { PaymentError } = __require('amounts');
+
+const TOPUP_MIN = 500;       // F — recharge minimum
+const TOPUP_MAX = 200000;    // F — recharge maximum par paiement
+
+function createCommissionCore({ db, now = () => Date.now(), random = Math.random }) {
+  const readVal = async (path) => (await db.ref(path).once('value')).val();
+  const rid = () => now().toString(36) + Math.floor(random() * 36 ** 4).toString(36).padStart(4, '0');
+
+  async function ledger(uid, id, entry) {
+    await db.ref('commissionLedger/' + uid + '/' + id).set({ ...entry, at: now() });
+  }
+
+  // Appelée par le serveur de paiement quand une recharge est CONFIRMÉE payée.
+  // Une seule fois par paiement, même si la notification du prestataire est rejouée.
+  async function creditTopup({ txId, driverId, amount }) {
+    if (!txId || !driverId || !Number.isInteger(amount) || amount <= 0) throw new PaymentError('invalid-argument', 'Recharge invalide.');
+    const claim = await db.ref('payments/' + txId + '/credited').transaction((cur) => (cur ? undefined : now()));
+    if (!claim.committed) return { credited: false, reason: 'already-credited' };
+    try {
+      await db.ref('driverWallets/' + driverId + '/commissionBalance').transaction((cur) => (cur || 0) + amount);
+      await ledger(driverId, 't_' + txId, { type: 'topup', amount, txId });
+      await db.ref('platformStats/commissionTopups').transaction((cur) => (cur || 0) + amount);
+    } catch (e) {
+      await db.ref('payments/' + txId + '/credited').set(null).catch(() => {});
+      throw e;
+    }
+    return { credited: true, amount };
+  }
+
+  // Le livreur autorise le prélèvement de sa commission en attente sur son solde.
+  async function payFromBalance({ uid, amount }) {
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    const driver = await readVal('drivers/' + uid);
+    if (!driver) throw new PaymentError('not-found', 'Compte livreur introuvable.');
+    const pending = Number(driver.pendingCommission || 0);
+    if (!(pending > 0)) throw new PaymentError('failed-precondition', 'Aucune commission en attente.');
+    let want = pending;
+    if (amount != null) {
+      if (!Number.isInteger(amount) || amount <= 0) throw new PaymentError('invalid-argument', 'Montant invalide.');
+      want = Math.min(amount, pending);
+    }
+    // 1) On prend sur le solde (au plus ce qu'il contient).
+    let take = 0;
+    const bal = await db.ref('driverWallets/' + uid + '/commissionBalance').transaction((cur) => {
+      const b = typeof cur === 'number' ? cur : 0;
+      take = Math.min(want, b);
+      return take > 0 ? b - take : undefined;
+    });
+    if (!bal.committed || take <= 0) throw new PaymentError('failed-precondition', 'Solde de commission insuffisant. Rechargez-le.');
+    // 2) On réduit la commission en attente (jamais en dessous de zéro).
+    let reduced = 0;
+    try {
+      await db.ref('drivers/' + uid + '/pendingCommission').transaction((cur) => {
+        const c = typeof cur === 'number' ? cur : 0;
+        reduced = Math.min(take, c);
+        return c - reduced;
+      });
+    } catch (e) {
+      await db.ref('driverWallets/' + uid + '/commissionBalance').transaction((cur) => (cur || 0) + take).catch(() => {});
+      throw e;
+    }
+    // La commission a pu être soldée entre-temps (par l'admin) : on rend l'excédent.
+    if (reduced < take) await db.ref('driverWallets/' + uid + '/commissionBalance').transaction((cur) => (cur || 0) + (take - reduced));
+    if (reduced > 0) {
+      await ledger(uid, 'c_' + rid(), { type: 'commission', amount: reduced });
+      await db.ref('platformStats/commissionFromBalance').transaction((cur) => (cur || 0) + reduced);
+    }
+    const left = await readVal('drivers/' + uid + '/pendingCommission');
+    const balanceLeft = await readVal('driverWallets/' + uid + '/commissionBalance');
+    return { ok: true, paid: reduced, pendingLeft: left || 0, balanceLeft: balanceLeft || 0 };
+  }
+
+  return { creditTopup, payFromBalance, constants: { TOPUP_MIN, TOPUP_MAX } };
+}
+
+module.exports = { createCommissionCore, TOPUP_MIN, TOPUP_MAX };
+
+});
+
+// ---------- lib/commissionHandlers.js ----------
+__define('commissionHandlers', function (module, exports, require) {
+'use strict';
+
+const { PaymentError } = __require('amounts');
+
+function makePayCommissionFromBalance({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.payFromBalance({ uid: request.auth && request.auth.uid, amount: request.data && request.data.amount });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[commission] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { makePayCommissionFromBalance };
+
+});
+
+// ---------- lib/referralCore.js ----------
+__define('referralCore', function (module, exports, require) {
+'use strict';
+
+// Crédit de parrainage — UNIQUEMENT décidé par le serveur.
+//
+// Avant : l'application du client ajoutait elle-même 25 F au solde du parrain,
+// et les règles Firebase l'autorisaient à tout compte connecté (n'importe qui
+// pouvait donc s'ajouter du solde). Maintenant :
+//  - le parrain est lu dans le PROFIL de la boutique / du client (jamais dans
+//    la commande, que le client peut falsifier) ;
+//  - une seule indemnité par commande ou livraison (marqueur posé avant le crédit) ;
+//  - la commande / livraison doit être réellement terminée (et payée en ligne
+//    quand le paiement en ligne est choisi — statut posé seulement par le serveur) ;
+//  - un compte ne peut pas se parrainer lui-même ;
+//  - plafond journalier par parrain, contre les fausses commandes en série.
+
+const { PaymentError } = __require('amounts');
+
+const REWARD = 25;                                   // F crédités par commande / livraison terminée
+const VALID_MS = 2 * 365 * 24 * 60 * 60 * 1000;      // durée de validité du parrainage (mettre null pour illimité)
+const MAX_PER_DAY = 200;                             // crédits maximum par parrain et par jour (UTC)
+const CASH_MAX_PER_DAY = 5;                          // livraisons PAYÉES EN ESPÈCES créditées par client et par jour (non vérifiables : on borne)
+const MIN_WITHDRAWAL = 100;                          // retrait de parrainage minimum (F)
+const W_ID_RE = /^w_[a-z0-9]{3,40}$/;
+const PHONE_RE = /^\+?[0-9 ()-]{8,20}$/;
+const ID_RE = /^[A-Za-z0-9_-]{3,60}$/;
+const KINDS = ['marketplaceOrders', 'deliveryRequests'];
+
+function createReferralCore({ db, now = () => Date.now(), random = Math.random, validMs = VALID_MS, reward = REWARD, maxPerDay = MAX_PER_DAY, cashMaxPerDay = CASH_MAX_PER_DAY, minWithdrawal = MIN_WITHDRAWAL }) {
+  const readVal = async (path) => (await db.ref(path).once('value')).val();
+  const dayKey = () => new Date(now()).toISOString().slice(0, 10).replace(/-/g, '');
+
+  // Crédite le parrain, une seule fois pour cette commande / livraison.
+  async function creditOnce({ kind, id, beneficiaryUid, referrerUid, referredAt, cashCap = false }) {
+    if (!referrerUid || typeof referrerUid !== 'string') return { credited: false, reason: 'no-referrer' };
+    if (!beneficiaryUid || referrerUid === beneficiaryUid) return { credited: false, reason: 'self-referral' };
+    if (validMs && referredAt && now() - referredAt > validMs) return { credited: false, reason: 'expired' };
+    const referrer = await readVal('users/' + referrerUid);
+    if (!referrer) return { credited: false, reason: 'unknown-referrer' };
+
+    const key = kind + '_' + id;
+    // 1) Marqueur "déjà crédité" : si deux appels arrivent ensemble, un seul passe.
+    const mark = await db.ref('referralCredits/' + key).transaction((cur) => (cur ? undefined : { referrerUid, beneficiaryUid, amount: reward, at: now() }));
+    if (!mark.committed) return { credited: false, reason: 'already-credited' };
+
+    try {
+      // 1 bis) Livraison payée en espèces (non vérifiable) : au plus quelques crédits par client et par jour.
+      if (cashCap) {
+        const cc = await db.ref('referralCashDaily/' + beneficiaryUid + '/' + dayKey()).transaction((cur) => ((cur || 0) >= cashMaxPerDay ? undefined : (cur || 0) + 1));
+        if (!cc.committed) { await db.ref('referralCredits/' + key).set(null); return { credited: false, reason: 'cash-limit' }; }
+      }
+      // 2) Plafond journalier du parrain.
+      const cap = await db.ref('referralDaily/' + referrerUid + '/' + dayKey()).transaction((cur) => ((cur || 0) >= maxPerDay ? undefined : (cur || 0) + 1));
+      if (!cap.committed) {
+        await db.ref('referralCredits/' + key).set(null);
+        return { credited: false, reason: 'daily-limit' };
+      }
+      // 3) Le crédit lui-même, champ par champ (sans réécrire tout le profil).
+      await db.ref('users/' + referrerUid + '/referralBalance').transaction((cur) => (cur || 0) + reward);
+      await db.ref('users/' + referrerUid + '/referralCount').transaction((cur) => (cur || 0) + 1);
+      await db.ref('platformStats/referralPayouts').transaction((cur) => (cur || 0) + reward);
+    } catch (e) {
+      await db.ref('referralCredits/' + key).set(null).catch(() => {});
+      throw e;
+    }
+    return { credited: true, amount: reward };
+  }
+
+  // Appelée par le serveur lui-même quand il vient de régler une commande (paymentCore).
+  async function creditMarketplaceOrder({ id, order }) {
+    if (!order || !order.shopId) return { credited: false, reason: 'no-shop' };
+    const shop = await readVal('shops/' + order.shopId);
+    return creditOnce({ kind: 'marketplaceOrders', id, beneficiaryUid: order.shopId, referrerUid: shop && shop.referredBy, referredAt: shop && shop.referredAt });
+  }
+
+  // Appelée par l'application (point d'accès creditReferral) une fois la commande / livraison terminée.
+  async function creditForCompletion({ callerUid, kind, id }) {
+    if (!callerUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (!KINDS.includes(kind)) throw new PaymentError('invalid-argument', 'Type invalide.');
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw new PaymentError('invalid-argument', 'Identifiant invalide.');
+    const rec = await readVal(kind + '/' + id);
+    if (!rec) throw new PaymentError('not-found', 'Introuvable.');
+    const isAdmin = !!(await readVal('adminUsers/' + callerUid));
+
+    if (kind === 'marketplaceOrders') {
+      if (!isAdmin && ![rec.clientUid, rec.shopId, rec.assignedDriverId].includes(callerUid)) throw new PaymentError('permission-denied', "Cette commande n'est pas la vôtre.");
+      if (rec.status !== 'completed') throw new PaymentError('failed-precondition', "Cette commande n'est pas terminée.");
+      if (rec.paymentStatus !== 'paid') throw new PaymentError('failed-precondition', "Cette commande n'a pas été payée.");
+      return creditMarketplaceOrder({ id, order: rec });
+    }
+    if (!isAdmin && ![rec.clientUid, rec.assignedDriverId].includes(callerUid)) throw new PaymentError('permission-denied', "Cette livraison n'est pas la vôtre.");
+    if (rec.status !== 'completed') throw new PaymentError('failed-precondition', "Cette livraison n'est pas terminée.");
+    if (rec.paymentMethod === 'online' && rec.paymentStatus !== 'paid') throw new PaymentError('failed-precondition', "Cette livraison n'a pas été payée.");
+    const isCash = rec.paymentMethod !== 'online';
+    // Espèces : il faut un livreur distinct du client (sinon on pourrait se livrer soi-même).
+    if (isCash && (!rec.assignedDriverId || rec.assignedDriverId === rec.clientUid)) return { credited: false, reason: 'invalid-driver' };
+    const client = rec.clientUid ? await readVal('users/' + rec.clientUid) : null;
+    return creditOnce({ kind, id, beneficiaryUid: rec.clientUid, referrerUid: client && client.referredBy, referredAt: client && client.referredAt, cashCap: isCash });
+  }
+
+  // ---------- retraits de parrainage ----------
+  // Le solde est DÉBITÉ ici, au moment de la demande (avant, il n'était jamais débité :
+  // on pouvait redemander le même montant). Un refus par l'admin le REMBOURSE.
+  async function requestWithdrawal({ uid, amount, phone }) {
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (!Number.isInteger(amount) || amount < minWithdrawal) throw new PaymentError('invalid-argument', 'Montant invalide (minimum ' + minWithdrawal + ' F).');
+    const ph = String(phone || '').trim();
+    if (!PHONE_RE.test(ph)) throw new PaymentError('invalid-argument', 'Numéro Mobile Money invalide.');
+    const user = await readVal('users/' + uid);
+    if (!user) throw new PaymentError('not-found', 'Compte introuvable.');
+    const debit = await db.ref('users/' + uid + '/referralBalance').transaction((cur) => (typeof cur === 'number' && cur >= amount ? cur - amount : undefined));
+    if (!debit.committed) throw new PaymentError('failed-precondition', 'Solde de parrainage insuffisant.');
+    const id = 'w_' + now().toString(36) + Math.floor(random() * 36 ** 5).toString(36).padStart(5, '0');
+    try {
+      await db.ref('withdrawalRequests/' + id).set({
+        kind: 'referral', debited: true, clientUid: uid, shopName: 'Parrainage — ' + String(user.name || '').slice(0, 60),
+        amount, phone: ph, status: 'pending', requestedAt: now(),
+      });
+    } catch (e) {
+      await db.ref('users/' + uid + '/referralBalance').transaction((cur) => (cur || 0) + amount).catch(() => {});
+      throw e;
+    }
+    return { ok: true, withdrawalId: id, amount };
+  }
+
+  const isReferralWithdrawal = (w) => w && (w.kind === 'referral' || (!w.kind && typeof w.clientUid === 'string' && String(w.shopName || '').indexOf('Parrainage') === 0));
+
+  async function decideWithdrawal({ adminUid, withdrawalId, decision }) {
+    if (!adminUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (!(await readVal('adminUsers/' + adminUid))) throw new PaymentError('permission-denied', 'Réservé aux administrateurs.');
+    if (typeof withdrawalId !== 'string' || !W_ID_RE.test(withdrawalId)) throw new PaymentError('invalid-argument', 'Identifiant de demande invalide.');
+    if (decision !== 'paid' && decision !== 'rejected') throw new PaymentError('invalid-argument', 'Décision invalide.');
+    const wRef = db.ref('withdrawalRequests/' + withdrawalId);
+    const w = await readVal('withdrawalRequests/' + withdrawalId);
+    if (!w) throw new PaymentError('not-found', 'Demande introuvable.');
+    if (!isReferralWithdrawal(w)) throw new PaymentError('failed-precondition', "Cette demande n'est pas un retrait de parrainage.");
+    if (w.status !== 'pending') throw new PaymentError('already-exists', 'Cette demande a déjà été traitée.');
+    if (!Number.isInteger(w.amount) || w.amount <= 0) throw new PaymentError('failed-precondition', 'Montant de la demande invalide.');
+    const balRef = db.ref('users/' + w.clientUid + '/referralBalance');
+    let debitedNow = false;
+    // Ancienne demande (créée avant ce correctif) : le solde n'avait pas été débité, on le fait au paiement.
+    if (decision === 'paid' && !w.debited) {
+      const d = await balRef.transaction((cur) => (typeof cur === 'number' && cur >= w.amount ? cur - w.amount : undefined));
+      if (!d.committed) throw new PaymentError('failed-precondition', "Le solde de parrainage actuel est inférieur à ce montant : ne versez rien, refusez la demande.");
+      debitedNow = true;
+    }
+    const claim = await wRef.child('status').transaction((cur) => (cur === 'pending' ? decision : undefined));
+    if (!claim.committed) {
+      if (debitedNow) await balRef.transaction((cur) => (cur || 0) + w.amount);
+      throw new PaymentError('already-exists', 'Cette demande vient d\'être traitée.');
+    }
+    const upd = { processedBy: adminUid, processedAt: now() };
+    if (debitedNow) upd.debited = true;
+    if (decision === 'rejected' && w.debited) { await balRef.transaction((cur) => (cur || 0) + w.amount); upd.refunded = true; }
+    await wRef.update(upd);
+    return { ok: true, status: decision, refunded: !!upd.refunded };
+  }
+
+  return { creditForCompletion, creditMarketplaceOrder, creditOnce, requestWithdrawal, decideWithdrawal, constants: { REWARD: reward, MAX_PER_DAY: maxPerDay, VALID_MS: validMs, CASH_MAX_PER_DAY: cashMaxPerDay, MIN_WITHDRAWAL: minWithdrawal } };
+}
+
+module.exports = { createReferralCore };
+
+});
+
+// ---------- lib/referralHandlers.js ----------
+__define('referralHandlers', function (module, exports, require) {
+'use strict';
+
+const { PaymentError } = __require('amounts');
+
+function makeCreditReferral({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.creditForCompletion({
+        callerUid: request.auth && request.auth.uid,
+        kind: request.data && request.data.kind,
+        id: request.data && request.data.id,
+      });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[parrainage] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+function makeRequestReferralWithdrawal({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.requestWithdrawal({ uid: request.auth && request.auth.uid, amount: request.data && request.data.amount, phone: request.data && request.data.phone });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[parrainage] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+function makeDecideReferralWithdrawal({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.decideWithdrawal({ adminUid: request.auth && request.auth.uid, withdrawalId: request.data && request.data.withdrawalId, decision: request.data && request.data.decision });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[parrainage] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { makeCreditReferral, makeRequestReferralWithdrawal, makeDecideReferralWithdrawal };
 
 });
 
@@ -692,6 +1087,7 @@ function makeCreatePayment({ getCore, HttpsError }) {
         uid: request.auth && request.auth.uid,
         orderIds: request.data && request.data.orderIds,
         deliveryRequestId: request.data && request.data.deliveryRequestId,
+        commissionTopup: request.data && request.data.commissionTopup,
       });
     } catch (e) {
       throw toHttpsError(e);
@@ -837,6 +1233,163 @@ function makeCreateDriverPayout({ getCore, HttpsError }) {
 }
 
 module.exports = { makeCreateDriverPayout };
+
+});
+
+// ---------- lib/notifyCore.js ----------
+__define('notifyCore', function (module, exports, require) {
+'use strict';
+
+const { PaymentError } = __require('amounts');
+
+// Distance de recherche des livreurs "à proximité" d'une nouvelle demande —
+// toute la zone de service tient dans Ouagadougou, donc une valeur généreuse
+// mais bornée, plutôt que de prévenir absolument tout le monde à chaque fois.
+const NEARBY_RADIUS_KM = 6;
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371, toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function createNotifyCore({ db, messaging, now = () => Date.now() }) {
+  async function readVal(path) {
+    const snap = await db.ref(path).once('value');
+    return snap.val();
+  }
+
+  // Envoie à UNE personne précise, à partir du jeton qu'elle a enregistré.
+  // Un jeton absent n'est jamais une erreur (navigateur sans notifications,
+  // personne qui n'a jamais accepté) — juste rien à envoyer.
+  async function sendToOne({ collection, uid, title, body, data }) {
+    if (!uid) return { sent: false, reason: 'no-uid' };
+    const token = await readVal(collection + '/' + uid + '/fcmToken');
+    if (!token) return { sent: false, reason: 'no-token' };
+    try {
+      await messaging.send({
+        token,
+        notification: { title, body },
+        data: Object.fromEntries(Object.entries(data || {}).map(([k, v]) => [k, String(v)])),
+      });
+      return { sent: true };
+    } catch (e) {
+      const code = e && e.code;
+      if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') {
+        // Jeton périmé (app désinstallée, permission retirée...) : on le
+        // retire pour ne plus jamais réessayer dessus inutilement.
+        await db.ref(collection + '/' + uid + '/fcmToken').remove();
+      }
+      return { sent: false, reason: 'send-failed', error: String(e && e.message) };
+    }
+  }
+
+  // Prévient la boutique d'une nouvelle commande — jamais sur la seule foi de
+  // ce que le client prétend : on relit la vraie commande en base, on
+  // vérifie qu'elle lui appartient bien, et le message envoyé est toujours le
+  // même texte fixé ici (jamais un texte libre fourni par le client).
+  async function notifyShopNewOrder({ clientUid, orderId }) {
+    if (!clientUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (typeof orderId !== 'string' || !/^CMD-[A-Z0-9]{6,20}$/.test(orderId)) {
+      throw new PaymentError('invalid-argument', 'Identifiant de commande invalide.');
+    }
+    const o = await readVal('marketplaceOrders/' + orderId);
+    if (!o) throw new PaymentError('not-found', 'Commande introuvable.');
+    if (o.clientUid !== clientUid) throw new PaymentError('permission-denied', "Cette commande n'est pas la vôtre.");
+    const result = await sendToOne({
+      collection: 'shops', uid: o.shopId,
+      title: 'Nouvelle commande',
+      body: "Une nouvelle commande vient d'arriver sur votre boutique.",
+      data: { type: 'new_order', orderId },
+    });
+    return { ok: true, ...result };
+  }
+
+  // Prévient les livreurs disponibles à proximité d'une nouvelle demande
+  // (livraison simple, ou commande boutique prête à être livrée) — jamais
+  // tout le monde, et jamais sans vérifier que la demande existe vraiment.
+  // Déclenchée soit par le client lui-même (livraison simple, à la création),
+  // soit par la boutique concernée (commande marketplace, une fois préparée
+  // et confirmée — pas à la création, les livreurs n'ont rien à y faire
+  // avant que la boutique ne l'ait acceptée).
+  async function notifyNearbyRequest({ callerUid, kind, requestId }) {
+    if (!callerUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (kind !== 'delivery' && kind !== 'order') throw new PaymentError('invalid-argument', 'Type de demande invalide.');
+    const isDelivery = kind === 'delivery';
+    if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{3,40}$/.test(requestId)) {
+      throw new PaymentError('invalid-argument', 'Identifiant invalide.');
+    }
+    const collection = isDelivery ? 'deliveryRequests' : 'marketplaceOrders';
+    const req = await readVal(collection + '/' + requestId);
+    if (!req) throw new PaymentError('not-found', 'Demande introuvable.');
+    const isOwner = req.clientUid === callerUid || (!isDelivery && req.shopId === callerUid);
+    if (!isOwner) throw new PaymentError('permission-denied', "Cette demande ne vous appartient pas.");
+    const coords = isDelivery ? req.senderCoords : req.clientCoords;
+    if (!coords || typeof coords.lat !== 'number' || typeof coords.lng !== 'number') {
+      return { ok: true, sent: 0, total: 0 };
+    }
+    const all = (await readVal('drivers')) || {};
+    const nearby = Object.entries(all).filter(([, d]) => (
+      d && d.online && d.status === 'approved' && typeof d.lat === 'number' && typeof d.lng === 'number'
+      && haversineKm(coords.lat, coords.lng, d.lat, d.lng) <= NEARBY_RADIUS_KM
+    ));
+    const results = await Promise.all(nearby.map(([uid]) => sendToOne({
+      collection: 'drivers', uid,
+      title: 'Nouvelle livraison à proximité',
+      body: isDelivery ? 'Une personne cherche un livreur près de vous.' : 'Une commande boutique est prête à être livrée près de vous.',
+      data: { type: 'nearby_request', kind, requestId },
+    })));
+    return { ok: true, sent: results.filter((r) => r.sent).length, total: results.length };
+  }
+
+  return { notifyShopNewOrder, notifyNearbyRequest };
+}
+
+module.exports = { createNotifyCore, haversineKm };
+
+});
+
+// ---------- lib/notifyHandlers.js ----------
+__define('notifyHandlers', function (module, exports, require) {
+'use strict';
+
+const { PaymentError } = __require('amounts');
+
+function makeNotifyShopNewOrder({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.notifyShopNewOrder({
+        clientUid: request.auth && request.auth.uid,
+        orderId: request.data && request.data.orderId,
+      });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[notification] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+function makeNotifyNearbyRequest({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.notifyNearbyRequest({
+        callerUid: request.auth && request.auth.uid,
+        kind: request.data && request.data.kind,
+        requestId: request.data && request.data.requestId,
+      });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[notification] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { makeNotifyShopNewOrder, makeNotifyNearbyRequest };
 
 });
 
@@ -1517,6 +2070,9 @@ const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
 const payoutHandlers = __require('payoutHandlers');
+const notifyHandlers = __require('notifyHandlers');
+const referralHandlers = __require('referralHandlers');
+const commissionHandlers = __require('commissionHandlers');
 const smsGetCore = __require('smsGetCore');
 const otpHandlers = __require('otpHandlers');
 
@@ -1529,6 +2085,15 @@ module.exports = {
   makeMockPay: paymentHandlers.makeMockPay,
   getPayoutCore: paymentGetCore.getPayoutCore,
   makeCreateDriverPayout: payoutHandlers.makeCreateDriverPayout,
+  getNotifyCore: paymentGetCore.getNotifyCore,
+  makeNotifyShopNewOrder: notifyHandlers.makeNotifyShopNewOrder,
+  makeNotifyNearbyRequest: notifyHandlers.makeNotifyNearbyRequest,
+  getReferralCore: paymentGetCore.getReferralCore,
+  makeCreditReferral: referralHandlers.makeCreditReferral,
+  getCommissionCore: paymentGetCore.getCommissionCore,
+  makePayCommissionFromBalance: commissionHandlers.makePayCommissionFromBalance,
+  makeRequestReferralWithdrawal: referralHandlers.makeRequestReferralWithdrawal,
+  makeDecideReferralWithdrawal: referralHandlers.makeDecideReferralWithdrawal,
   getOtpCore: smsGetCore.getOtpCore,
   makeRequestOtp: otpHandlers.makeRequestOtp,
   makeVerifyOtp: otpHandlers.makeVerifyOtp,

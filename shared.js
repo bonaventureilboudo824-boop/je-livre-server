@@ -154,6 +154,12 @@ function serverBaseUrl() {
     || (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : 'http://localhost:3000');
 }
 
+// Envoie une notification à un CLIENT (jeton rangé dans users/<uid>/fcmToken).
+function makeClientNotify(admin) {
+  const nc = createNotifyCore({ db: admin.database(), messaging: admin.messaging() });
+  return ({ uid, title, body, data }) => nc.sendToOne({ collection: 'users', uid, title, body, data });
+}
+
 function getPaymentCore() {
   const admin = getAdmin();
   const providerName = process.env.PAYMENT_PROVIDER || 'mock';
@@ -164,7 +170,7 @@ function getPaymentCore() {
   };
   const allowedUids = () => (process.env.MOCK_TEST_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean);
   const provider = getProvider(providerName, { db, urls, allowedUids, token: process.env.HORUSPAY_SECRET_KEY });
-  return { core: createPaymentCore({ db, provider, providerName, urls }), provider, providerName };
+  return { core: createPaymentCore({ db, provider, providerName, urls, notify: makeClientNotify(admin) }), provider, providerName };
 }
 
 function getPayoutCore() {
@@ -186,7 +192,7 @@ function getNotifyCore() {
 
 function getReferralCore() {
   const admin = getAdmin();
-  return { core: createReferralCore({ db: admin.database() }) };
+  return { core: createReferralCore({ db: admin.database(), notify: makeClientNotify(admin) }) };
 }
 
 function getCommissionCore() {
@@ -268,8 +274,8 @@ const ORDER_ID_RE = /^CMD-[A-Z0-9]{3,24}$/;
 const TX_ID_RE = /^JL[A-Z0-9]{6,30}$/;
 const DELIVERY_REQUEST_ID_RE = /^dr_[a-z0-9]{3,40}$/;
 
-function createPaymentCore({ db, provider, providerName, urls, now = () => Date.now(), random = Math.random }) {
-  const referral = createReferralCore({ db, now });
+function createPaymentCore({ db, provider, providerName, urls, notify = null, now = () => Date.now(), random = Math.random }) {
+  const referral = createReferralCore({ db, now, notify });
   const commission = createCommissionCore({ db, now, random });
   const readVal = async (path) => (await db.ref(path).once('value')).val();
 
@@ -765,8 +771,14 @@ const PHONE_RE = /^\+?[0-9 ()-]{8,20}$/;
 const ID_RE = /^[A-Za-z0-9_-]{3,60}$/;
 const KINDS = ['marketplaceOrders', 'deliveryRequests'];
 
-function createReferralCore({ db, now = () => Date.now(), random = Math.random, validMs = VALID_MS, reward = REWARD, maxPerDay = MAX_PER_DAY, cashMaxPerDay = CASH_MAX_PER_DAY, minWithdrawal = MIN_WITHDRAWAL }) {
+function createReferralCore({ db, notify = null, now = () => Date.now(), random = Math.random, validMs = VALID_MS, reward = REWARD, maxPerDay = MAX_PER_DAY, cashMaxPerDay = CASH_MAX_PER_DAY, minWithdrawal = MIN_WITHDRAWAL }) {
   const readVal = async (path) => (await db.ref(path).once('value')).val();
+  // Une notification ne doit JAMAIS empêcher le crédit ou l'inscription : on essaie, on ignore l'échec.
+  async function safeNotify(args) {
+    if (!notify) return;
+    try { await notify(args); } catch (e) { console.warn('[parrainage] notification non envoyée :', e && e.message); }
+  }
+  const cleanName = (v, max) => String(v || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
   const dayKey = () => new Date(now()).toISOString().slice(0, 10).replace(/-/g, '');
 
   // Crédite le parrain, une seule fois pour cette commande / livraison.
@@ -802,6 +814,15 @@ function createReferralCore({ db, now = () => Date.now(), random = Math.random, 
       await db.ref('referralCredits/' + key).set(null).catch(() => {});
       throw e;
     }
+    // Le parrain est prévenu (sans jamais bloquer le crédit s'il ne peut pas l'être).
+    const entry = await readVal('referrals/' + referrerUid + '/' + beneficiaryUid);
+    const who = (entry && entry.name) || 'Votre filleul';
+    await safeNotify({
+      uid: referrerUid,
+      title: '+' + reward + ' F de parrainage',
+      body: who + (kind === 'marketplaceOrders' ? ' a reçu une commande' : ' a fait livrer un colis') + ' : ' + reward + ' F ajoutés à votre solde.',
+      data: { type: 'referral_credit' },
+    });
     return { credited: true, amount: reward };
   }
 
@@ -835,6 +856,34 @@ function createReferralCore({ db, now = () => Date.now(), random = Math.random, 
     if (isCash && (!rec.assignedDriverId || rec.assignedDriverId === rec.clientUid)) return { credited: false, reason: 'invalid-driver' };
     const client = rec.clientUid ? await readVal('users/' + rec.clientUid) : null;
     return creditOnce({ kind, id, beneficiaryUid: rec.clientUid, referrerUid: client && client.referredBy, referredAt: client && client.referredAt, cashCap: isCash });
+  }
+
+  // ---------- inscription d'un filleul : liste du parrain + notification ----------
+  // Appelée par le filleul juste après son inscription. Le serveur relit LUI-MÊME le parrain
+  // dans le profil du filleul (jamais dans ce que l'appelant envoie), une seule fois par filleul.
+  const REG_KINDS = { client: 'users', shop: 'shops' };
+  async function registerReferral({ uid, kind }) {
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    const coll = REG_KINDS[kind];
+    if (!coll) throw new PaymentError('invalid-argument', 'Type invalide.');
+    const rec = await readVal(coll + '/' + uid);
+    if (!rec) throw new PaymentError('not-found', 'Compte introuvable.');
+    const referrerUid = rec.referredBy;
+    if (!referrerUid || typeof referrerUid !== 'string') return { registered: false, reason: 'no-referrer' };
+    if (referrerUid === uid) return { registered: false, reason: 'self-referral' };
+    if (!(await readVal('users/' + referrerUid))) return { registered: false, reason: 'unknown-referrer' };
+    // Prénom pour une personne, nom complet pour une boutique.
+    const full = cleanName(rec.name || rec.shopName, 60);
+    const name = (kind === 'shop' ? full : full.split(' ')[0]).slice(0, 40) || 'Un nouveau membre';
+    const mark = await db.ref('referrals/' + referrerUid + '/' + uid).transaction((cur) => (cur ? undefined : { name, kind, at: now() }));
+    if (!mark.committed) return { registered: false, reason: 'already-registered' };
+    await safeNotify({
+      uid: referrerUid,
+      title: 'Nouveau filleul !',
+      body: name + " vient de s'inscrire avec votre code. Vous gagnerez " + reward + ' F à chaque commande ou livraison qu\'il génère.',
+      data: { type: 'referral_signup' },
+    });
+    return { registered: true, name };
   }
 
   // ---------- retraits de parrainage ----------
@@ -895,7 +944,7 @@ function createReferralCore({ db, now = () => Date.now(), random = Math.random, 
     return { ok: true, status: decision, refunded: !!upd.refunded };
   }
 
-  return { creditForCompletion, creditMarketplaceOrder, creditOnce, requestWithdrawal, decideWithdrawal, constants: { REWARD: reward, MAX_PER_DAY: maxPerDay, VALID_MS: validMs, CASH_MAX_PER_DAY: cashMaxPerDay, MIN_WITHDRAWAL: minWithdrawal } };
+  return { creditForCompletion, creditMarketplaceOrder, creditOnce, registerReferral, requestWithdrawal, decideWithdrawal, constants: { REWARD: reward, MAX_PER_DAY: maxPerDay, VALID_MS: validMs, CASH_MAX_PER_DAY: cashMaxPerDay, MIN_WITHDRAWAL: minWithdrawal } };
 }
 
 module.exports = { createReferralCore };
@@ -951,7 +1000,20 @@ function makeDecideReferralWithdrawal({ getCore, HttpsError }) {
   };
 }
 
-module.exports = { makeCreditReferral, makeRequestReferralWithdrawal, makeDecideReferralWithdrawal };
+function makeRegisterReferral({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.registerReferral({ uid: request.auth && request.auth.uid, kind: request.data && request.data.kind });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[parrainage] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { makeCreditReferral, makeRequestReferralWithdrawal, makeDecideReferralWithdrawal, makeRegisterReferral };
 
 });
 
@@ -1343,7 +1405,7 @@ function createNotifyCore({ db, messaging, now = () => Date.now() }) {
     return { ok: true, sent: results.filter((r) => r.sent).length, total: results.length };
   }
 
-  return { notifyShopNewOrder, notifyNearbyRequest };
+  return { notifyShopNewOrder, notifyNearbyRequest, sendToOne };
 }
 
 module.exports = { createNotifyCore, haversineKm };
@@ -2090,6 +2152,7 @@ module.exports = {
   makeNotifyNearbyRequest: notifyHandlers.makeNotifyNearbyRequest,
   getReferralCore: paymentGetCore.getReferralCore,
   makeCreditReferral: referralHandlers.makeCreditReferral,
+  makeRegisterReferral: referralHandlers.makeRegisterReferral,
   getCommissionCore: paymentGetCore.getCommissionCore,
   makePayCommissionFromBalance: commissionHandlers.makePayCommissionFromBalance,
   makeRequestReferralWithdrawal: referralHandlers.makeRequestReferralWithdrawal,

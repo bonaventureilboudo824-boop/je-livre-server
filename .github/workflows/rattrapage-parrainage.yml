@@ -1,0 +1,55 @@
+name: Rattrapage des filleuls (a lancer une fois apres le deploiement)
+
+# Ajoute a la liste de chaque parrain les filleuls qui se sont inscrits AVANT la mise en place
+# de la liste. Ne touche ni aux soldes ni aux comptes, n'envoie AUCUNE notification, et peut etre
+# relance sans danger (il n'ajoute que ce qui manque). Les identifiants sont masques dans le journal.
+on:
+  workflow_dispatch:
+
+jobs:
+  rattrapage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Installer firebase-admin
+        run: npm install --no-audit --no-fund firebase-admin@12
+      - name: Rattraper la liste des filleuls
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > rattrapage.js <<'EOF'
+          const admin = require('firebase-admin');
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)),
+            databaseURL: 'https://je-livre-509fd-default-rtdb.europe-west1.firebasedatabase.app',
+          });
+          const mask = (u) => String(u).slice(0, 6) + '...' + String(u).slice(-4);
+          const clean = (v, max) => String(v || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+          (async () => {
+            const db = admin.database();
+            const [users, shops, referrals] = await Promise.all(['users', 'shops', 'referrals'].map(async (p) => (await db.ref(p).once('value')).val() || {}));
+            const updates = {}; let toAdd = 0, already = 0, skipped = 0;
+            const consider = (kind, uid, rec) => {
+              const ref = rec && rec.referredBy;
+              if (!ref || typeof ref !== 'string') return;
+              if (ref === uid || !users[ref]) { skipped++; return; }
+              if (referrals[ref] && referrals[ref][uid]) { already++; return; }
+              const full = clean(rec.name || rec.shopName, 60);
+              const name = (kind === 'shop' ? full : full.split(' ')[0]).slice(0, 40) || 'Un nouveau membre';
+              const at = Number(rec.createdAt || rec.referredAt) || Date.now();
+              updates['referrals/' + ref + '/' + uid] = { name, kind, at };
+              toAdd++;
+              console.log('  + ' + kind + ' ' + mask(uid) + ' -> parrain ' + mask(ref) + ' (' + name + ')');
+            };
+            Object.entries(users).forEach(([uid, u]) => consider('client', uid, u));
+            Object.entries(shops).forEach(([uid, s]) => consider('shop', uid, s));
+            console.log('=== RATTRAPAGE DES FILLEULS ===');
+            console.log('A ajouter :', toAdd, '| deja dans la liste :', already, '| ignores (parrain introuvable ou auto-parrainage) :', skipped);
+            if (toAdd) await db.ref().update(updates);
+            console.log(toAdd ? '=> ' + toAdd + ' filleul(s) ajoute(s) a la liste de leur parrain.' : '=> Rien a rattraper.');
+            process.exit(0);
+          })().catch((e) => { console.error('Echec :', e.message); process.exit(1); });
+          EOF
+          node rattrapage.js

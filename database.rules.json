@@ -366,6 +366,12 @@
       "$uid": {
         ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())"
       }
+    },
+    "referrals": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$referrerUid": {
+        ".read": "auth != null && (auth.uid === $referrerUid || root.child('adminUsers').child(auth.uid).exists())"
+      }
     }
   }
 }

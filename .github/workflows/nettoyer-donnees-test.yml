@@ -1,0 +1,67 @@
+name: Nettoyer les donnees de test (livraisons et commandes)
+
+# Supprime les demandes de livraison et les commandes de boutiques de TEST.
+# Avant de supprimer, copie tout dans un nœud prive de la base (testCleanupBackup),
+# invisible pour les clients. Ne touche ni aux comptes, ni aux soldes, ni aux parametres.
+# Rien n'est affiche dans le journal a part des nombres.
+on:
+  workflow_dispatch:
+    inputs:
+      confirmer:
+        description: 'Tapez SUPPRIMER (en majuscules) pour confirmer'
+        required: true
+      avant:
+        description: 'Facultatif : ne supprimer QUE ce qui date d avant cette date (AAAA-MM-JJ). Vide = tout supprimer'
+        required: false
+        default: ''
+
+jobs:
+  nettoyage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verifier la confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirmer }}" != "SUPPRIMER" ]; then echo "Confirmation incorrecte : rien n'a ete supprime."; exit 1; fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Installer firebase-admin
+        run: npm install --no-audit --no-fund firebase-admin@12
+      - name: Sauvegarder puis supprimer
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          AVANT: ${{ github.event.inputs.avant }}
+        run: |
+          cat > nettoyage.js <<'EOF'
+          const admin = require('firebase-admin');
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)),
+            databaseURL: 'https://je-livre-509fd-default-rtdb.europe-west1.firebasedatabase.app',
+          });
+          const FIELDS = ['createdAt', 'timestamp', 'requestedAt', 'time'];
+          const cutoff = process.env.AVANT ? Date.parse(process.env.AVANT + 'T00:00:00Z') : null;
+          if (process.env.AVANT && Number.isNaN(cutoff)) { console.error('Date invalide : utilisez AAAA-MM-JJ'); process.exit(1); }
+          const stampOf = (o) => { for (const f of FIELDS) if (o && typeof o[f] === 'number') return o[f]; return null; };
+          (async () => {
+            const db = admin.database(); const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            console.log('=== NETTOYAGE DES DONNEES DE TEST ===');
+            console.log(cutoff ? 'Mode : seulement ce qui date d\'avant ' + process.env.AVANT : 'Mode : tout supprimer');
+            for (const path of ['deliveryRequests', 'marketplaceOrders']) {
+              const v = (await db.ref(path).once('value')).val() || {}; const keys = Object.keys(v);
+              const del = [], keep = [];
+              for (const k of keys) { const s = stampOf(v[k]); if (!cutoff || (s !== null && s < cutoff)) del.push(k); else keep.push(k); }
+              console.log(path + ' : ' + keys.length + ' en tout | a supprimer : ' + del.length + ' | conserves : ' + keep.length + (cutoff ? ' (dont sans date : ' + keep.filter((k) => stampOf(v[k]) === null).length + ')' : ''));
+              if (!del.length) continue;
+              const copy = {}; del.forEach((k) => { copy[k] = v[k]; });
+              await db.ref('testCleanupBackup/' + stamp + '/' + path).set(copy);
+              const back = (await db.ref('testCleanupBackup/' + stamp + '/' + path).once('value')).val() || {};
+              if (Object.keys(back).length !== del.length) throw new Error('Sauvegarde incomplete : RIEN n\'a ete supprime pour ' + path);
+              const upd = {}; del.forEach((k) => { upd[k] = null; }); await db.ref(path).update(upd);
+              const reste = Object.keys((await db.ref(path).once('value')).val() || {}).length;
+              console.log('  -> ' + del.length + ' sauvegardes puis supprimes | restant dans ' + path + ' : ' + reste);
+            }
+            console.log('=> Termine. Copie privee : testCleanupBackup/' + stamp + ' (a supprimer plus tard si vous voulez).');
+            process.exit(0);
+          })().catch((e) => { console.error('Echec :', e.message); process.exit(1); });
+          EOF
+          node nettoyage.js

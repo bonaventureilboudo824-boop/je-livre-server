@@ -231,7 +231,7 @@
       ],
       "$id": {
         ".read": "auth != null && (data.child('driverId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
-        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('driverId').val() === auth.uid && newData.child('status').val() === 'pending'))"
+        ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
       }
     },
     "platformStats": {
@@ -261,7 +261,7 @@
         "shopId"
       ],
       "$reelId": {
-        ".write": "auth != null && (newData.child('shopId').val() === auth.uid || data.child('shopId').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!root.child('bans').child(auth.uid).exists() && ((data.exists() && data.child('shopId').val() === auth.uid) || (!data.exists() && newData.child('shopId').val() === auth.uid && root.child('termsAcceptances').child(auth.uid).exists()))))",
         ".validate": "newData.hasChildren(['shopId', 'videoUrl', 'createdAt'])",
         "videoUrl": {
           ".validate": "newData.isString() && newData.val().length < 500"
@@ -316,7 +316,7 @@
       ".read": "auth != null",
       "$reelId": {
         "$commentId": {
-          ".write": "auth != null && ((!data.exists() && newData.child('uid').val() === auth.uid) || root.child('adminUsers').child(auth.uid).exists())",
+          ".write": "auth != null && ((!data.exists() && newData.child('uid').val() === auth.uid && !root.child('bans').child(auth.uid).exists() && root.child('termsAcceptances').child(auth.uid).exists()) || root.child('adminUsers').child(auth.uid).exists())",
           ".validate": "newData.hasChildren(['uid', 'name', 'text', 'createdAt'])",
           "uid": {
             ".validate": "newData.isString()"
@@ -371,6 +371,101 @@
       ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
       "$referrerUid": {
         ".read": "auth != null && (auth.uid === $referrerUid || root.child('adminUsers').child(auth.uid).exists())"
+      }
+    },
+    "reports": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      ".indexOn": [
+        "status"
+      ],
+      "$reportId": {
+        ".write": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (!data.exists() && newData.child('reporterUid').val() === auth.uid && newData.child('status').val() === 'open' && !root.child('bans').child(auth.uid).exists()))",
+        ".validate": "newData.hasChildren(['type', 'reason', 'reporterUid', 'createdAt', 'status'])",
+        "type": {
+          ".validate": "newData.val() === 'reel' || newData.val() === 'comment'"
+        },
+        "reason": {
+          ".validate": "newData.isString() && newData.val().length <= 40"
+        },
+        "details": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 300)"
+        },
+        "reporterUid": {
+          ".validate": "newData.isString()"
+        },
+        "reelId": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 80)"
+        },
+        "commentId": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 80)"
+        },
+        "targetUid": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 80)"
+        },
+        "targetName": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 80)"
+        },
+        "excerpt": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 300)"
+        },
+        "status": {
+          ".validate": "newData.val() === 'open' || newData.val() === 'actioned' || newData.val() === 'dismissed'"
+        },
+        "action": {
+          ".validate": "!newData.exists() || (newData.isString() && newData.val().length <= 40)"
+        },
+        "resolvedBy": {
+          ".validate": "!newData.exists() || newData.isString()"
+        },
+        "resolvedAt": {
+          ".validate": "!newData.exists() || newData.isNumber()"
+        },
+        "createdAt": {
+          ".validate": "newData.val() === now || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "$other": {
+          ".validate": "false"
+        }
+      }
+    },
+    "blocks": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        "$blockedUid": {
+          ".validate": "!newData.exists() || ($blockedUid !== auth.uid && newData.hasChildren(['name', 'at']) && newData.child('name').isString() && newData.child('name').val().length <= 80)"
+        }
+      }
+    },
+    "bans": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+        ".validate": "newData.hasChildren(['at', 'reason'])"
+      }
+    },
+    "termsAcceptances": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid",
+        ".write": "auth != null && auth.uid === $uid",
+        ".validate": "newData.hasChildren(['version', 'acceptedAt']) && newData.child('version').isString() && newData.child('version').val().length <= 20",
+        "acceptedAt": {
+          ".validate": "newData.val() === now"
+        }
+      }
+    },
+    "presence": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$role": {
+        "$uid": {
+          ".write": "auth != null && auth.uid === $uid && ($role === 'client' || $role === 'vendor' || $role === 'driver' || $role === 'entreprise')",
+          ".validate": "!newData.exists() || newData.hasChildren(['at'])",
+          "at": {
+            ".validate": "newData.val() === now"
+          }
+        }
       }
     }
   }

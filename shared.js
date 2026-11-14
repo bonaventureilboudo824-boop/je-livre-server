@@ -285,7 +285,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
   }
 
   // Recharge du solde de commission d'un livreur (garantie).
-  async function createCommissionTopup({ uid, amount }) {
+  async function createCommissionTopup({ uid, amount, thenPay = false }) {
     if (!Number.isInteger(amount) || amount < TOPUP_MIN || amount > TOPUP_MAX) {
       throw new PaymentError('invalid-argument', 'Montant de recharge invalide (entre ' + TOPUP_MIN + ' et ' + TOPUP_MAX + ' F).');
     }
@@ -301,12 +301,13 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     await db.ref('payments/' + txId).set({
       txId, clientUid: uid, kind: 'commissionTopup', driverId: uid, amount, currency: CURRENCY,
       provider: providerName, status: 'initiated', createdAt: now(),
+      ...(thenPay ? { thenPayCommission: true } : {}),
     });
     let checkout;
     try {
       checkout = await provider.createCheckout({
         txId, amount, currency: CURRENCY,
-        description: 'Recharge commission Je Livre',
+        description: thenPay ? 'Paiement commission Je Livre' : 'Recharge commission Je Livre',
         customer: { uid, phone: driver.phone || '' },
         returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
         notifyUrl: urls.webhookUrl,
@@ -323,8 +324,18 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     return { txId, paymentUrl: checkout.paymentUrl, amount };
   }
 
-  async function createPayment({ uid, orderIds, deliveryRequestId, commissionTopup }) {
+  async function createPayment({ uid, orderIds, deliveryRequestId, commissionTopup, payCommission }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    // Le livreur paie sa commission par Mobile Money : le serveur calcule le montant à payer
+    // (jamais le client) ; la commission est soldée automatiquement dès que le paiement est confirmé.
+    if (payCommission === true) {
+      const pending = Number(await readVal('drivers/' + uid + '/pendingCommission') || 0);
+      const balance = Number(await readVal('driverWallets/' + uid + '/commissionBalance') || 0);
+      if (!(pending > 0)) throw new PaymentError('failed-precondition', "Vous n'avez aucune commission à payer.");
+      const need = pending - balance;
+      if (need <= 0) throw new PaymentError('failed-precondition', 'Votre solde de commission couvre déjà cette commission : utilisez « Payer avec mon solde ».');
+      return createCommissionTopup({ uid, amount: Math.min(TOPUP_MAX, Math.max(TOPUP_MIN, need)), thenPay: true });
+    }
     if (commissionTopup != null) return createCommissionTopup({ uid, amount: commissionTopup });
     if (deliveryRequestId != null) return createDeliveryPayment({ uid, deliveryRequestId });
     if (!Array.isArray(orderIds) || orderIds.length < 1 || orderIds.length > MAX_ORDERS_PER_PAYMENT
@@ -560,7 +571,14 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
       // Recharge du solde de commission d'un livreur : on crédite son solde (une seule fois).
       if (pay.kind === 'commissionTopup') {
         await commission.creditTopup({ txId, driverId: pay.driverId, amount: pay.amount });
-        await payRef.update({ status: 'paid', paidAt: now(), verifiedAmount: Number(verified.amount) });
+        // Paiement « de la commission » : on solde la commission avec l'argent qui vient d'arriver.
+        // Si cette seconde étape échoue, l'argent reste sur le solde du livreur (rien n'est perdu).
+        let paidCommission = 0;
+        if (pay.thenPayCommission) {
+          try { const r = await commission.payFromBalance({ uid: pay.driverId }); paidCommission = (r && r.paid) || 0; }
+          catch (e) { console.error('[commission] règlement automatique impossible', e && e.message); }
+        }
+        await payRef.update({ status: 'paid', paidAt: now(), verifiedAmount: Number(verified.amount), paidCommission });
         return { ok: true, paid: true, status: 'paid' };
       }
 
@@ -1150,6 +1168,7 @@ function makeCreatePayment({ getCore, HttpsError }) {
         orderIds: request.data && request.data.orderIds,
         deliveryRequestId: request.data && request.data.deliveryRequestId,
         commissionTopup: request.data && request.data.commissionTopup,
+        payCommission: request.data && request.data.payCommission === true,
       });
     } catch (e) {
       throw toHttpsError(e);
@@ -1208,6 +1227,9 @@ __define('payoutCore', function (module, exports, require) {
 const { PaymentError } = __require('amounts');
 
 const MIN_PAYOUT = 100; // minimum HorusPay documenté pour un virement
+const WITHDRAW_MIN = 500; // retrait du solde de commission : minimum
+const WITHDRAW_DAILY_MAX = 200000; // plafond de retrait par livreur et par jour
+const WITHDRAW_THROTTLE_MS = 15000; // anti double-clic
 const VALID_MODES = ['moov_bf', 'orange_bf_direct']; // Burkina Faso (voir docs HorusPay > Méthodes de paiement)
 
 function createPayoutCore({ db, provider, now = () => Date.now() }) {
@@ -1262,10 +1284,80 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
     return { ok: true, payoutId: payout.payoutId, fees: payout.fees, netAmount: payout.netAmount };
   }
 
-  return { createDriverPayout };
+  // ---- Retrait du solde de commission par le livreur lui-même (automatique) ----
+  // Garde-fous : seulement l'excédent qui ne sert pas à couvrir la commission en attente,
+  // virement UNIQUEMENT sur le numéro enregistré du livreur, plafond par jour,
+  // et remboursement automatique si le virement échoue.
+  async function createCommissionWithdrawal({ uid, amount, network }) {
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (!Number.isInteger(amount) || amount < WITHDRAW_MIN || amount > WITHDRAW_DAILY_MAX) {
+      throw new PaymentError('invalid-argument', 'Montant invalide (entre ' + WITHDRAW_MIN + ' et ' + WITHDRAW_DAILY_MAX + ' F).');
+    }
+    if (!VALID_MODES.includes(network)) throw new PaymentError('invalid-argument', 'Réseau Mobile Money invalide.');
+    const driver = await readVal('drivers/' + uid);
+    if (!driver) throw new PaymentError('not-found', 'Compte livreur introuvable.');
+    if (!driver.approved) throw new PaymentError('failed-precondition', "Votre compte livreur n'est pas encore validé.");
+    const phone = String(driver.phone || '').trim();
+    if (!/^\+?\d[\d\s]{6,14}$/.test(phone)) {
+      throw new PaymentError('failed-precondition', "Aucun numéro Mobile Money valide n'est enregistré sur votre compte. Contactez-nous.");
+    }
+    const throttle = await db.ref('withdrawThrottle/' + uid).transaction((cur) => (typeof cur === 'number' && now() - cur < WITHDRAW_THROTTLE_MS ? undefined : now()));
+    if (!throttle.committed) throw new PaymentError('resource-exhausted', 'Veuillez patienter quelques secondes avant de réessayer.');
+
+    const pending = Number(driver.pendingCommission || 0);
+    const walletRef = (suffix) => db.ref('driverWallets/' + uid + '/' + suffix);
+    const refund = (n) => walletRef('commissionBalance').transaction((cur) => (cur || 0) + n);
+    const day = new Date(now()).toISOString().slice(0, 10);
+    const ledgerSet = (key, entry) => db.ref('commissionLedger/' + uid + '/' + key).set({ ...entry, at: now() });
+
+    // 1) On débite le solde — jamais en dessous de la commission en attente.
+    let seen = 0;
+    const debit = await walletRef('commissionBalance').transaction((cur) => {
+      const b = typeof cur === 'number' ? cur : 0; seen = b;
+      return b - amount >= pending ? b - amount : undefined;
+    });
+    if (!debit.committed) {
+      const available = Math.max(0, seen - pending);
+      throw new PaymentError('failed-precondition', 'Montant supérieur à votre solde disponible pour un retrait (' + available + ' F) : le reste sert à couvrir votre commission en attente.');
+    }
+    // 2) Plafond du jour.
+    const cap = await walletRef('withdrawnByDay/' + day).transaction((cur) => {
+      const c = typeof cur === 'number' ? cur : 0;
+      return c + amount <= WITHDRAW_DAILY_MAX ? c + amount : undefined;
+    });
+    if (!cap.committed) {
+      await refund(amount);
+      throw new PaymentError('resource-exhausted', 'Plafond de retrait du jour atteint (' + WITHDRAW_DAILY_MAX + ' F par jour).');
+    }
+    // 3) Enregistrement puis virement.
+    const id = 'w_' + now().toString(36) + Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, '0');
+    try {
+      await db.ref('withdrawalRequests/' + id).set({ kind: 'commissionBalance', driverId: uid, amount, phone, network, status: 'initiating', debited: true, requestedAt: now() });
+    } catch (e) {
+      await refund(amount); await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
+      throw new PaymentError('unavailable', "Le retrait n'a pas pu être enregistré. Votre solde n'a pas été débité.");
+    }
+    let payout;
+    try {
+      payout = await provider.createPayout({ amount, currency: 'XOF', mode: network, phone });
+    } catch (e) {
+      await refund(amount);
+      await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
+      await db.ref('withdrawalRequests/' + id).update({ status: 'failed', refunded: true, lastError: String(e && e.message).slice(0, 500), failedAt: now() }).catch(() => {});
+      await ledgerSet('wr_' + id, { type: 'withdrawal_refund', amount, withdrawalId: id }).catch(() => {});
+      throw new PaymentError('unavailable', "Le virement n'a pas pu être effectué. Votre solde n'a pas été débité. Réessayez dans un instant.");
+    }
+    await db.ref('withdrawalRequests/' + id).update({ status: 'processing', payoutId: payout.payoutId, fees: payout.fees, netAmount: payout.netAmount, processedAt: now() });
+    await ledgerSet('w_' + id, { type: 'withdrawal', amount, withdrawalId: id, netAmount: payout.netAmount });
+    await db.ref('platformStats/commissionWithdrawn').transaction((cur) => (cur || 0) + amount);
+    const balanceLeft = (await readVal('driverWallets/' + uid + '/commissionBalance')) || 0;
+    return { ok: true, withdrawalId: id, amount, fees: payout.fees, netAmount: payout.netAmount, balanceLeft };
+  }
+
+  return { createDriverPayout, createCommissionWithdrawal };
 }
 
-module.exports = { createPayoutCore };
+module.exports = { createPayoutCore, WITHDRAW_MIN, WITHDRAW_DAILY_MAX };
 
 });
 
@@ -1294,7 +1386,27 @@ function makeCreateDriverPayout({ getCore, HttpsError }) {
   };
 }
 
-module.exports = { makeCreateDriverPayout };
+function makeRequestCommissionWithdrawal({ getCore, HttpsError }) {
+  const toHttpsError = (e) => {
+    if (e instanceof PaymentError) return new HttpsError(e.code, e.message);
+    console.error('[retrait commission] erreur inattendue', e);
+    return new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+  };
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.createCommissionWithdrawal({
+        uid: request.auth && request.auth.uid,
+        amount: request.data && request.data.amount,
+        network: request.data && request.data.network,
+      });
+    } catch (e) {
+      throw toHttpsError(e);
+    }
+  };
+}
+
+module.exports = { makeCreateDriverPayout, makeRequestCommissionWithdrawal };
 
 });
 
@@ -2128,6 +2240,311 @@ module.exports = function createBbgProvider({ token, senderId }) {
 });
 
 // ---------- Ce dont les points d'accès (api/*.js) ont besoin ----------
+
+// ---------- lib/accountCore.js (suppression de compte) ----------
+__define('accountCore', function (module, exports, require) {
+'use strict';
+// Suppression d'un compte Je Livre (exigence Google Play + droit de suppression).
+// Principe : (1) on refuse si la personne a de l'argent ou une obligation en cours,
+// (2) on supprime ses données personnelles, (3) on ANONYMISE les enregistrements
+// comptables conservés (commandes, livraisons, paiements, retraits), (4) on supprime
+// le compte de connexion EN DERNIER (si ça échoue, la personne peut réessayer).
+
+class AccountError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+const ACTIVE_STATUSES = ['pending', 'awaiting_payment', 'assigned', 'pending_delivery'];
+const PII_KEYS = ['clientName', 'clientPhone', 'clientAddress', 'clientCoords', 'phone', 'payerPhone', 'momoPhone', 'msisdn',
+  'address', 'deliveryAddress', 'senderPhone', 'senderAddress', 'senderCoords', 'recipientPhone', 'recipientAddress',
+  'recipientCoords', 'driverName', 'driverPhone', 'shopPhone', 'name', 'fullName', 'email', 'coords', 'description'];
+// collection -> champs qui rattachent un enregistrement à une personne
+const OWNER_FIELDS = {
+  deliveryRequests: ['clientUid', 'assignedDriverId'],
+  marketplaceOrders: ['clientUid', 'shopId', 'assignedDriverId', 'driverId'],
+  payments: ['clientUid', 'driverId'],
+  withdrawalRequests: ['clientUid', 'shopId', 'driverId'],
+  commissionPayments: ['driverId'],
+  remittances: ['driverId'],
+};
+const FULL_UNLINK = ['clientUid', 'uid']; // champs qu'on efface complètement
+const MARK = 'compte-supprime';
+const PROFILE_NODES = ['users', 'shops', 'drivers', 'enterprises'];
+const money = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
+
+function createAccountCore({ db, auth, now }) {
+  now = now || (() => Date.now());
+  const val = async (path) => (await db.ref(path).once('value')).val();
+  const byChild = async (path, field, v) => (await db.ref(path).orderByChild(field).equalTo(v).once('value')).val() || {};
+
+  async function findBlockers(uid, profiles) {
+    const reasons = [];
+    const fmt = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, '\u00A0') + '\u00A0F';
+    for (const node of PROFILE_NODES) {
+      const p = profiles[node];
+      if (!p) continue;
+      if (money(p.referralBalance) > 0) reasons.push('Votre solde de parrainage est de ' + fmt(p.referralBalance) + '. Demandez d\'abord un retrait, ou contactez-nous.');
+      if (money(p.earningsBalance) > 0) reasons.push('Il vous reste ' + fmt(p.earningsBalance) + ' de gains à retirer.');
+      if (money(p.pendingCommission) > 0) reasons.push('Vous avez une commission de ' + fmt(p.pendingCommission) + ' à régler.');
+    }
+    const wallet = await val('driverWallets/' + uid);
+    if (wallet && money(wallet.commissionBalance) > 0) reasons.push('Votre solde de commission est de ' + fmt(wallet.commissionBalance) + '. Contactez-nous pour le récupérer avant de supprimer votre compte.');
+    // retraits en attente
+    for (const f of ['clientUid', 'shopId', 'driverId']) {
+      const w = await byChild('withdrawalRequests', f, uid);
+      if (Object.values(w).some((x) => x && x.status === 'pending')) { reasons.push('Une demande de retrait est en attente de traitement.'); break; }
+    }
+    // livraisons / commandes en cours
+    let active = false;
+    for (const [coll, fields] of [['deliveryRequests', ['clientUid', 'assignedDriverId']], ['marketplaceOrders', ['clientUid', 'shopId', 'assignedDriverId', 'driverId']]]) {
+      for (const f of fields) {
+        const r = await byChild(coll, f, uid);
+        if (Object.values(r).some((x) => x && ACTIVE_STATUSES.indexOf(x.status) !== -1)) { active = true; break; }
+      }
+      if (active) break;
+    }
+    if (active) reasons.push('Vous avez une livraison ou une commande en cours. Attendez qu\'elle soit terminée.');
+    // entreprise : flotte
+    if (profiles.enterprises) {
+      const fleet = await byChild('drivers', 'enterpriseId', uid);
+      if (Object.keys(fleet).length > 0) reasons.push('Votre entreprise a encore des livreurs dans sa flotte. Contactez-nous pour les transférer ou les retirer.');
+    }
+    return reasons;
+  }
+
+  async function deleteAccount({ uid, confirm }) {
+    if (!uid || typeof uid !== 'string') throw new AccountError('unauthenticated', 'Connectez-vous pour supprimer votre compte.');
+    if (confirm !== 'SUPPRIMER') throw new AccountError('invalid-argument', 'Confirmation manquante : écrivez SUPPRIMER.');
+    if (await val('adminUsers/' + uid)) throw new AccountError('permission-denied', 'Un compte administrateur ne peut pas être supprimé depuis l\'application.');
+
+    const profiles = {};
+    for (const node of PROFILE_NODES) profiles[node] = await val(node + '/' + uid);
+
+    const reasons = await findBlockers(uid, profiles);
+    if (reasons.length) throw new AccountError('failed-precondition', 'Suppression impossible pour le moment : ' + reasons.join(' '));
+
+    const upd = {};
+    const removed = { profils: 0, produits: 0, reels: 0, commentaires: 0, enregistrements_anonymises: 0 };
+
+    // 1) profils et nœuds rattachés à la personne
+    for (const node of PROFILE_NODES) if (profiles[node]) { upd[node + '/' + uid] = null; removed.profils++; }
+    for (const node of ['registrations', 'userAffinity', 'reelLikes', 'driverWallets', 'blocks', 'termsAcceptances', 'referrals']) upd[node + '/' + uid] = null;
+
+    // 2) codes de parrainage, liste du parrain, ticket du service client
+    for (const node of PROFILE_NODES) {
+      const p = profiles[node]; if (!p) continue;
+      if (typeof p.referralCode === 'string' && p.referralCode) {
+        const owner = await val('referralCodes/' + p.referralCode);
+        if (owner === uid) upd['referralCodes/' + p.referralCode] = null;
+      }
+      if (typeof p.referredBy === 'string' && p.referredBy) upd['referrals/' + p.referredBy + '/' + uid] = null;
+      if (typeof p.supportTicketId === 'string' && p.supportTicketId) upd['supportTickets/' + p.supportTicketId] = null;
+    }
+
+    // 3) contenus publiés : produits, Reels (et leurs commentaires / stats)
+    const products = await byChild('products', 'shopId', uid);
+    for (const id of Object.keys(products)) { upd['products/' + id] = null; removed.produits++; }
+    const reels = await byChild('reels', 'shopId', uid);
+    for (const id of Object.keys(reels)) { upd['reels/' + id] = null; upd['reelComments/' + id] = null; upd['reelStats/' + id] = null; removed.reels++; }
+
+    // 4) commentaires écrits par la personne sous les Reels des autres
+    const allComments = (await val('reelComments')) || {};
+    for (const [reelId, byId] of Object.entries(allComments)) {
+      if (reels[reelId]) continue;
+      for (const [cid, c] of Object.entries(byId || {})) if (c && c.uid === uid) { upd['reelComments/' + reelId + '/' + cid] = null; removed.commentaires++; }
+    }
+
+    // 5) enregistrements conservés (comptabilité) : on efface les données personnelles
+    const touched = new Set();
+    for (const [coll, fields] of Object.entries(OWNER_FIELDS)) {
+      for (const f of fields) {
+        const recs = await byChild(coll, f, uid);
+        for (const [id, rec] of Object.entries(recs)) {
+          if (!rec) continue;
+          const key = coll + '/' + id;
+          if (!touched.has(key)) { touched.add(key); removed.enregistrements_anonymises++; }
+          for (const k of PII_KEYS) if (rec[k] !== undefined && rec[k] !== null) upd[key + '/' + k] = null;
+          if (typeof rec.shopName === 'string' && rec.shopName.indexOf('Parrainage') === 0) upd[key + '/shopName'] = 'Parrainage — compte supprimé';
+          if (FULL_UNLINK.indexOf(f) !== -1) upd[key + '/' + f] = null;
+          else upd[key + '/' + f] = MARK;
+          upd[key + '/anonymizedAt'] = now();
+        }
+      }
+    }
+
+    if (Object.keys(upd).length) await db.ref().update(upd);
+
+    // 6) le compte de connexion, en dernier
+    try { await auth.deleteUser(uid); }
+    catch (e) { if (!(e && e.code === 'auth/user-not-found')) throw new AccountError('internal', 'Vos données sont supprimées mais la fermeture du compte a échoué. Réessayez dans un instant.'); }
+    return { ok: true, removed };
+  }
+
+  return { deleteAccount, findBlockers };
+}
+
+module.exports = { createAccountCore, AccountError, ACTIVE_STATUSES, PII_KEYS };
+});
+
+// ---------- lib/accountHandlers.js ----------
+__define('accountHandlers', function (module, exports, require) {
+'use strict';
+
+const { getAdmin } = require('firebaseAdmin');
+const { createAccountCore, AccountError } = require('accountCore');
+
+function getAccountCore() {
+  const admin = getAdmin();
+  return { core: createAccountCore({ db: admin.database(), auth: admin.auth() }) };
+}
+
+function makeDeleteAccount({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.deleteAccount({ uid: request.auth && request.auth.uid, confirm: request.data && request.data.confirm });
+    } catch (e) {
+      if (e instanceof AccountError) throw new HttpsError(e.code, e.message);
+      console.error('[suppression de compte] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { getAccountCore, makeDeleteAccount };
+});
+
+
+
+// ---------- lib/statsCore.js (chiffres d'ensemble de l'admin) ----------
+__define('statsCore', function (module, exports, require) {
+'use strict';
+// Chiffres d'ensemble pour le tableau de bord admin (réservé au super admin).
+// Tout est calculé côté serveur : le navigateur de l'admin n'a pas le droit de lire
+// la liste des clients, et les montants ne doivent pas être visibles du service client.
+
+class StatsError extends Error { constructor(code, message) { super(message); this.code = code; } }
+
+const DAY = 86400000;
+const num = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
+const sumField = (obj, f) => Object.values(obj || {}).reduce((t, x) => t + (x && typeof x === 'object' ? num(x[f]) : 0), 0);
+const count = (obj) => Object.keys(obj || {}).length;
+
+function createStatsCore({ db, auth, now, maxAuthPages }) {
+  now = now || (() => Date.now());
+  maxAuthPages = maxAuthPages || 50;
+  const val = async (p) => (await db.ref(p).once('value')).val();
+  let cache = null;
+
+  async function requireSuperAdmin(uid) {
+    if (!uid) throw new StatsError('unauthenticated', 'Connexion requise.');
+    const a = await val('adminUsers/' + uid);
+    const roles = a ? (Array.isArray(a.roles) ? a.roles : (a.role ? [a.role] : [])) : [];
+    if (roles.indexOf('super_admin') === -1) throw new StatsError('permission-denied', 'Ces chiffres sont réservés au super admin.');
+  }
+
+  async function authStats(t) {
+    const out = { accountsTotal: 0, createdLast7d: 0, createdLast30d: 0, activeLast24h: 0, activeLast7d: 0, activeLast30d: 0, truncated: false };
+    let token, pages = 0;
+    do {
+      const page = await auth.listUsers(1000, token);
+      for (const u of page.users || []) {
+        out.accountsTotal++;
+        const m = u.metadata || {};
+        const created = Date.parse(m.creationTime || ''), seen = Date.parse(m.lastRefreshTime || m.lastSignInTime || '');
+        if (created && t - created <= 7 * DAY) out.createdLast7d++;
+        if (created && t - created <= 30 * DAY) out.createdLast30d++;
+        if (seen) { const age = t - seen; if (age <= DAY) out.activeLast24h++; if (age <= 7 * DAY) out.activeLast7d++; if (age <= 30 * DAY) out.activeLast30d++; }
+      }
+      token = page.pageToken; pages++;
+    } while (token && pages < maxAuthPages);
+    if (token) out.truncated = true;
+    return out;
+  }
+
+  async function getStats({ uid }) {
+    await requireSuperAdmin(uid);
+    const t = now();
+    if (cache && t - cache.at < 15000) return cache.data;
+    const [users, shops, drivers, enterprises, payments, withdrawals, ps, wallets, authS] = await Promise.all([
+      val('users'), val('shops'), val('drivers'), val('enterprises'), val('payments'), val('withdrawalRequests'), val('platformStats'), val('driverWallets'), authStats(t),
+    ]);
+    // ---- personnes
+    const people = Object.assign({ clients: count(users), shops: { total: count(shops), approved: Object.values(shops || {}).filter((s) => s && s.approved === true).length },
+      drivers: count(drivers), enterprises: { total: count(enterprises), approved: Object.values(enterprises || {}).filter((e) => e && e.approved === true).length } }, authS);
+    // ---- argent reçu en ligne (brut : inclut l'argent qui sera reversé à d'autres)
+    const byKind = { delivery: 0, marketplaceOrders: 0, commissionTopup: 0, other: 0 };
+    let paidTotal = 0, paid30 = 0, paidCount = 0;
+    for (const p of Object.values(payments || {})) {
+      if (!p || p.status !== 'paid') continue;
+      const a = num(p.amount); paidTotal += a; paidCount++;
+      if (t - num(p.createdAt) <= 30 * DAY) paid30 += a;
+      if (Object.prototype.hasOwnProperty.call(byKind, p.kind)) byKind[p.kind] += a; else byKind.other += a;
+    }
+    // ---- revenu de la plateforme (compteurs cumulés)
+    const s = ps || {};
+    const simple = num(s.commissionSimple), flat = num(s.commissionFlat), referralPayouts = num(s.referralPayouts);
+    // Les commissions payées avec le solde du livreur (ou par Mobile Money via le solde) sont un REVENU :
+    // le compteur « commissionFromBalance » les suit depuis le début.
+    const fromWallet = num(s.commissionFromBalance);
+    const net = simple + flat + fromWallet - referralPayouts;
+    // Argent des livreurs que nous détenons : somme exacte des soldes (et non un calcul approximatif).
+    const driverGuarantees = sumField(wallets, 'commissionBalance');
+    const receivable = sumField(drivers, 'pendingCommission');
+    // ---- argent détenu pour d'autres (ne vous appartient pas)
+    const referralBalances = sumField(users, 'referralBalance') + sumField(shops, 'referralBalance') + sumField(drivers, 'referralBalance');
+    const pendingWithdrawals = Object.values(withdrawals || {}).filter((w) => w && w.status === 'pending').reduce((x, w) => x + num(w.amount), 0);
+    const owed = { driverGuarantees, referralBalances, pendingWithdrawals };
+    const data = {
+      generatedAt: t, people,
+      money: {
+        onlinePaid: { total: paidTotal, last30d: paid30, count: paidCount, byKind },
+        platform: { commissionSimple: simple, commissionFlat: flat, commissionFromWallet: fromWallet, referralPayouts, net, receivableFromDrivers: receivable },
+        owedToOthers: Object.assign({ total: driverGuarantees + referralBalances + pendingWithdrawals }, owed),
+      },
+    };
+    cache = { at: t, data };
+    return data;
+  }
+  return { getStats };
+}
+
+module.exports = { createStatsCore, StatsError };
+});
+
+// ---------- lib/statsHandlers.js ----------
+__define('statsHandlers', function (module, exports, require) {
+'use strict';
+
+const { getAdmin } = require('firebaseAdmin');
+const { createStatsCore, StatsError } = require('statsCore');
+
+function getStatsCore() {
+  const admin = getAdmin();
+  return { core: createStatsCore({ db: admin.database(), auth: admin.auth() }) };
+}
+
+// Le cache de 15 s vit dans le cœur : on garde donc UNE instance par processus.
+let cached = null;
+function getStatsCoreCached() { if (!cached) cached = getStatsCore(); return cached; }
+
+function makeAdminStats({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.getStats({ uid: request.auth && request.auth.uid });
+    } catch (e) {
+      if (e instanceof StatsError) throw new HttpsError(e.code, e.message);
+      console.error('[statistiques] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { getStatsCore: getStatsCoreCached, makeAdminStats };
+});
+
+
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
@@ -2137,6 +2554,8 @@ const referralHandlers = __require('referralHandlers');
 const commissionHandlers = __require('commissionHandlers');
 const smsGetCore = __require('smsGetCore');
 const otpHandlers = __require('otpHandlers');
+const accountHandlers = __require('accountHandlers');
+const statsHandlers = __require('statsHandlers');
 
 module.exports = {
   wrapCallable: adapter.wrapCallable,
@@ -2147,6 +2566,7 @@ module.exports = {
   makeMockPay: paymentHandlers.makeMockPay,
   getPayoutCore: paymentGetCore.getPayoutCore,
   makeCreateDriverPayout: payoutHandlers.makeCreateDriverPayout,
+  makeRequestCommissionWithdrawal: payoutHandlers.makeRequestCommissionWithdrawal,
   getNotifyCore: paymentGetCore.getNotifyCore,
   makeNotifyShopNewOrder: notifyHandlers.makeNotifyShopNewOrder,
   makeNotifyNearbyRequest: notifyHandlers.makeNotifyNearbyRequest,
@@ -2162,4 +2582,8 @@ module.exports = {
   makeVerifyOtp: otpHandlers.makeVerifyOtp,
   makeClaimVerification: otpHandlers.makeClaimVerification,
   makeResetPassword: otpHandlers.makeResetPassword,
+  getAccountCore: accountHandlers.getAccountCore,
+  makeDeleteAccount: accountHandlers.makeDeleteAccount,
+  getStatsCore: statsHandlers.getStatsCore,
+  makeAdminStats: statsHandlers.makeAdminStats,
 };

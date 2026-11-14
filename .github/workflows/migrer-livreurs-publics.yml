@@ -1,0 +1,50 @@
+name: Copier les donnees publiques des livreurs (driverPublic)
+
+# Copie nom, vehicule, position et statut en ligne de chaque livreur vers le nœud
+# public "driverPublic". Ne copie JAMAIS le telephone, les gains ni la commission.
+# Sans danger : peut etre relance autant de fois que necessaire.
+on:
+  workflow_dispatch:
+
+jobs:
+  migrer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Installer firebase-admin
+        run: npm install --no-audit --no-fund firebase-admin@12
+      - name: Copier
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > migrer.js <<'EOS'
+          const admin = require('firebase-admin');
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)),
+            databaseURL: 'https://je-livre-509fd-default-rtdb.europe-west1.firebasedatabase.app',
+          });
+          (async () => {
+            const db = admin.database();
+            const all = (await db.ref('drivers').once('value')).val() || {};
+            const upd = {}; let n = 0, skipped = 0;
+            for (const [id, d] of Object.entries(all)) {
+              if (!d || typeof d !== 'object' || d.simulated || id.startsWith('proto_sim_')) { skipped++; continue; }
+              const pub = {};
+              if (typeof d.name === 'string') pub.name = d.name.slice(0, 80);
+              if (typeof d.vehicle === 'string') pub.vehicle = d.vehicle.slice(0, 30);
+              if (typeof d.lat === 'number' && typeof d.lng === 'number') { pub.lat = d.lat; pub.lng = d.lng; }
+              if (typeof d.heading === 'number') pub.heading = d.heading;
+              if (typeof d.updatedAt === 'number') pub.updatedAt = d.updatedAt;
+              if (typeof d.available === 'boolean') pub.available = d.available;
+              pub.online = d.approved === true && d.online === true;
+              for (const [k, v] of Object.entries(pub)) upd['driverPublic/' + id + '/' + k] = v;
+              n++;
+            }
+            if (n) await db.ref().update(upd);
+            console.log('Livreurs copies : ' + n + ' | ignores (simules) : ' + skipped);
+            process.exit(0);
+          })().catch((e) => { console.error('ERREUR : ' + e.message); process.exit(1); });
+          EOS
+          node migrer.js

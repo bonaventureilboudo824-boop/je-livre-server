@@ -60,6 +60,39 @@
         }
       }
     },
+    "driverPublic": {
+      ".read": "auth != null",
+      "$uid": {
+        ".write": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        "lat": {
+          ".validate": "newData.isNumber() && newData.val() >= -90 && newData.val() <= 90"
+        },
+        "lng": {
+          ".validate": "newData.isNumber() && newData.val() >= -180 && newData.val() <= 180"
+        },
+        "heading": {
+          ".validate": "newData.isNumber()"
+        },
+        "updatedAt": {
+          ".validate": "newData.isNumber()"
+        },
+        "available": {
+          ".validate": "newData.isBoolean()"
+        },
+        "online": {
+          ".validate": "newData.isBoolean() && (newData.val() !== true || root.child('drivers').child($uid).child('approved').val() === true)"
+        },
+        "name": {
+          ".validate": "newData.isString() && newData.val().length <= 80"
+        },
+        "vehicle": {
+          ".validate": "newData.isString() && newData.val().length <= 30"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
     "deliveryRequests": {
       ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'status' && query.equalTo == 'pending') || (query.orderByChild == 'assignedDriverId' && query.equalTo == auth.uid) || (query.orderByChild == 'assignedDriverId' && root.child('drivers').child(query.equalTo).child('enterpriseId').val() == auth.uid) || (query.orderByChild == 'clientUid' && query.equalTo == auth.uid))",
       ".indexOn": [

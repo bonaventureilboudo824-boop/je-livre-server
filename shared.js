@@ -2364,7 +2364,7 @@ function createAccountCore({ db, auth, now }) {
 
     // 1) profils et nœuds rattachés à la personne
     for (const node of PROFILE_NODES) if (profiles[node]) { upd[node + '/' + uid] = null; removed.profils++; }
-    for (const node of ['registrations', 'userAffinity', 'reelLikes', 'driverWallets', 'blocks', 'termsAcceptances', 'referrals']) upd[node + '/' + uid] = null;
+    for (const node of ['registrations', 'userAffinity', 'reelLikes', 'driverWallets', 'driverPublic', 'blocks', 'termsAcceptances', 'referrals']) upd[node + '/' + uid] = null;
 
     // 2) codes de parrainage, liste du parrain, ticket du service client
     for (const node of PROFILE_NODES) {

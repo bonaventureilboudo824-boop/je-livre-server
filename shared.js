@@ -1288,7 +1288,7 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
   // Garde-fous : seulement l'excédent qui ne sert pas à couvrir la commission en attente,
   // virement UNIQUEMENT sur le numéro enregistré du livreur, plafond par jour,
   // et remboursement automatique si le virement échoue.
-  async function createCommissionWithdrawal({ uid, amount, network }) {
+  async function runCommissionWithdrawal({ uid, amount, network }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
     if (!Number.isInteger(amount) || amount < WITHDRAW_MIN || amount > WITHDRAW_DAILY_MAX) {
       throw new PaymentError('invalid-argument', 'Montant invalide (entre ' + WITHDRAW_MIN + ' et ' + WITHDRAW_DAILY_MAX + ' F).');
@@ -1354,6 +1354,41 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
     return { ok: true, withdrawalId: id, amount, fees: payout.fees, netAmount: payout.netAmount, balanceLeft };
   }
 
+  // Clé d'idempotence : l'app envoie la même clé tant que le livreur n'a pas changé d'avis.
+  // Un renvoi (réseau coupé, relance) ne crée JAMAIS un deuxième virement : on rend le résultat du premier.
+  // Sans clé (anciennes versions de l'app), le comportement reste celui d'avant (délai anti double-clic).
+  const KEY_RE = /^[A-Za-z0-9_-]{16,64}$/;
+  const KEY_STALE_MS = 120000;
+  async function createCommissionWithdrawal({ uid, amount, network, requestKey }) {
+    if (requestKey === undefined || requestKey === null || requestKey === '') {
+      return runCommissionWithdrawal({ uid, amount, network });
+    }
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (typeof requestKey !== 'string' || !KEY_RE.test(requestKey)) {
+      throw new PaymentError('invalid-argument', 'Clé de demande invalide.');
+    }
+    const keyRef = db.ref('withdrawKeys/' + uid + '/' + requestKey);
+    const claim = await keyRef.transaction((cur) => (cur ? undefined : { state: 'started', amount, network, at: now() }));
+    if (!claim.committed) {
+      const prev = (await keyRef.once('value')).val() || {};
+      if (prev.state === 'done' && prev.result) return { ...prev.result, replayed: true };
+      if (prev.state === 'started' && now() - (prev.at || 0) < KEY_STALE_MS) {
+        throw new PaymentError('already-exists', 'Cette demande est déjà en cours de traitement. Patientez un instant, ne la renvoyez pas.');
+      }
+      throw new PaymentError('failed-precondition', "Cette demande a déjà été reçue. Vérifiez votre solde et l'historique avant de réessayer.");
+    }
+    try {
+      const result = await runCommissionWithdrawal({ uid, amount, network });
+      await keyRef.set({ state: 'done', amount, network, at: now(), result }).catch(() => {});
+      return result;
+    } catch (e) {
+      // Erreur "propre" (refus avant débit, ou débit remboursé) : on libère la clé pour qu'un vrai nouvel essai soit possible.
+      // Erreur inattendue (après virement peut-être) : on garde la clé verrouillée, pas de rejeu automatique.
+      if (e instanceof PaymentError) await keyRef.remove().catch(() => {});
+      throw e;
+    }
+  }
+
   return { createDriverPayout, createCommissionWithdrawal };
 }
 
@@ -1399,6 +1434,7 @@ function makeRequestCommissionWithdrawal({ getCore, HttpsError }) {
         uid: request.auth && request.auth.uid,
         amount: request.data && request.data.amount,
         network: request.data && request.data.network,
+        requestKey: request.data && request.data.requestKey,
       });
     } catch (e) {
       throw toHttpsError(e);

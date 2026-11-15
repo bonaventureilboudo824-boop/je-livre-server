@@ -59,4 +59,28 @@ ok(b.as(U('ent1')).read('drivers/d1').allowed, 'B : l\'entreprise lit ses livreu
 ok(!b.as(U('ent2')).read('drivers/d1').allowed, 'B : une autre entreprise non');
 ok(b.as(U('ent1')).read('drivers', { query: { orderByChild: 'enterpriseId', equalTo: 'ent1' } }).allowed, 'B : l\'entreprise liste sa flotte par requête');
 ok(!b.as(U('ent1')).read('drivers', { query: { orderByChild: 'enterpriseId', equalTo: 'ent2' } }).allowed, 'B : pas la flotte d\'une autre entreprise');
+
+// ---- Mode invité : le catalogue public se lit sans compte, rien d'autre
+{
+  const d = targaryen.database(phaseA, Object.assign({}, data, {
+    shops: { s1: { name: 'Boutique A', approved: true, phone: '+22670000009' }, s2: { name: 'En attente', approved: false } },
+    products: { p1: { name: 'Robe', shopId: 's1' } }, reels: { r1: { shopId: 's1' } }, ads: { a1: { title: 'Pub' } },
+  }));
+  ok(d.as(null).read('products').allowed, 'invité lit les produits');
+  ok(d.as(null).read('reels').allowed, 'invité lit les Reels');
+  ok(d.as(null).read('ads').allowed, 'invité lit les pubs');
+  ok(d.as(null).read('reelStats').allowed && d.as(null).read('productStats').allowed && d.as(null).read('reelComments').allowed, 'invité lit les compteurs et commentaires');
+  ok(d.as(null).read('shops', { query: { orderByChild: 'approved', equalTo: true } }).allowed, 'invité lit les boutiques validées (requête)');
+  ok(!d.as(null).read('shops').allowed, 'invité ne lit pas tout le nœud boutiques');
+  ok(d.as(null).read('shops/s1').allowed, 'invité lit une boutique validée');
+  ok(!d.as(null).read('shops/s2').allowed, 'invité ne lit pas une boutique en attente');
+  ok(!d.as(U('client9')).read('shops/s2').allowed, 'un client non plus');
+  ok(d.as(U('s2')).read('shops/s2').allowed, 'la boutique en attente lit sa propre fiche');
+  for (const node of ['users/u1', 'deliveryRequests', 'marketplaceOrders', 'payments', 'driverWallets', 'withdrawalRequests', 'registrations', 'referrals', 'reports', 'presence', 'notifications', 'driverPublic']) {
+    ok(!d.as(null).read(node).allowed, 'invité ne lit pas ' + node);
+  }
+  ok(!d.as(null).write('products/p9', { name: 'x', shopId: 's1' }).allowed, 'invité ne peut rien écrire (produit)');
+  ok(!d.as(null).write('reels/r9', { shopId: 's1' }).allowed, 'invité ne peut rien écrire (reel)');
+  ok(!d.as(null).write('reelStats/r1/likeCount', 99).allowed, 'invité ne peut pas gonfler les compteurs');
+}
 console.log('rulesLivreurs : ' + n + ' vérifications OK');

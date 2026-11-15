@@ -174,12 +174,12 @@
       }
     },
     "shops": {
-      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'approved' && query.equalTo == true))",
+      ".read": "(auth != null && root.child('adminUsers').child(auth.uid).exists()) || (query.orderByChild == 'approved' && query.equalTo == true)",
       ".indexOn": [
         "approved"
       ],
       "$shopId": {
-        ".read": "auth != null && (data.child('approved').val() === true || auth.uid === $shopId)",
+        ".read": "data.child('approved').val() === true || (auth != null && auth.uid === $shopId)",
         ".write": "auth != null && (auth.uid === $shopId || root.child('adminUsers').child(auth.uid).exists())",
         "referredBy": {
           ".validate": "!newData.exists() || (newData.isString() && newData.val() !== $shopId && root.child('users').child(newData.val()).exists() && (!data.exists() || data.val() === newData.val() || data.parent().child('approved').val() !== true || root.child('adminUsers').child(auth.uid).exists()))"
@@ -190,7 +190,7 @@
       }
     },
     "products": {
-      ".read": "auth != null",
+      ".read": true,
       ".indexOn": [
         "shopId"
       ],
@@ -227,7 +227,7 @@
       }
     },
     "ads": {
-      ".read": "auth != null",
+      ".read": true,
       "$adId": {
         ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()"
       }
@@ -289,7 +289,7 @@
       }
     },
     "reels": {
-      ".read": "auth != null",
+      ".read": true,
       ".indexOn": [
         "shopId"
       ],
@@ -313,7 +313,7 @@
       ".write": false
     },
     "reelStats": {
-      ".read": "auth != null",
+      ".read": true,
       "$reelId": {
         ".write": "auth != null",
         "viewCount": {
@@ -334,7 +334,7 @@
       }
     },
     "productStats": {
-      ".read": "auth != null",
+      ".read": true,
       "$productKey": {
         ".write": "auth != null",
         "viewCount": {
@@ -346,7 +346,7 @@
       }
     },
     "reelComments": {
-      ".read": "auth != null",
+      ".read": true,
       "$reelId": {
         "$commentId": {
           ".write": "auth != null && ((!data.exists() && newData.child('uid').val() === auth.uid && !root.child('bans').child(auth.uid).exists() && root.child('termsAcceptances').child(auth.uid).exists()) || root.child('adminUsers').child(auth.uid).exists())",

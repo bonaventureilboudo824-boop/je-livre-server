@@ -2581,6 +2581,90 @@ module.exports = { getStatsCore: getStatsCoreCached, makeAdminStats };
 });
 
 
+// ---------- link/linkHandlers.js : un compte livreur / boutique / entreprise peut aussi commander ----------
+__define('linkHandlers', function (module, exports, require) {
+'use strict';
+
+const { getAdmin } = require('firebaseAdmin');
+
+class LinkError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// Un compte professionnel dont le téléphone a déjà été vérifié par SMS (claim phoneVerified) devient
+// aussi un compte client, SANS nouveau SMS : même identifiant (uid), les informations du profil
+// (nom, téléphone) sont recopiées dans users/<uid>. Le serveur renvoie un jeton de connexion pour
+// ce même uid ; il ne crée donc jamais un compte sur un numéro que la personne n'a pas vérifié.
+function createLinkCore({ db, auth, now, randomInt }) {
+  const clock = now || Date.now;
+  const rnd = randomInt || ((n) => Math.floor(Math.random() * n));
+  async function val(path) { return (await db.ref(path).once('value')).val(); }
+
+  async function uniqueCode(uid) {
+    for (let i = 0; i < 12; i++) {
+      let code = '';
+      for (let k = 0; k < 6; k++) code += CODE_CHARS[rnd(CODE_CHARS.length)];
+      const r = await db.ref('referralCodes/' + code).transaction((cur) => (cur === null || cur === undefined ? uid : undefined));
+      if (r && r.committed) return code;
+    }
+    throw new LinkError('internal', 'Impossible de créer votre compte client pour le moment. Réessayez.');
+  }
+
+  async function linkClientAccount({ uid }) {
+    if (!uid || typeof uid !== 'string') throw new LinkError('unauthenticated', 'Connexion requise.');
+    if (await val('adminUsers/' + uid)) throw new LinkError('permission-denied', 'Un compte administrateur ne peut pas passer commande.');
+    const [driver, shop, ent] = await Promise.all([val('drivers/' + uid), val('shops/' + uid), val('enterprises/' + uid)]);
+    const kind = driver ? 'driver' : (shop ? 'shop' : (ent ? 'enterprise' : null));
+    const prof = driver || shop || ent;
+    if (!prof) throw new LinkError('failed-precondition', 'Aucun compte livreur, boutique ou entreprise trouvé pour cet identifiant.');
+    let user;
+    try { user = await auth.getUser(uid); } catch (e) { throw new LinkError('not-found', 'Compte introuvable.'); }
+    if (user.disabled) throw new LinkError('permission-denied', 'Ce compte est désactivé.');
+    if (!(user.customClaims && user.customClaims.phoneVerified)) throw new LinkError('failed-precondition', "Votre numéro n'est pas encore vérifié.");
+    if (await val('bans/' + uid)) throw new LinkError('permission-denied', 'Ce compte est suspendu.');
+    const phone = String(prof.phone || '').slice(0, 30);
+    if (!phone) throw new LinkError('failed-precondition', 'Aucun numéro de téléphone sur votre compte.');
+    const name = String(prof.name || 'Utilisateur Je Livre').slice(0, 80);
+
+    const existing = await val('users/' + uid);
+    let created = false;
+    if (!existing) {
+      const referralCode = await uniqueCode(uid);
+      await db.ref('users/' + uid).set({ name, phone, referralCode, linkedFrom: kind, createdAt: clock() });
+      created = true;
+    }
+    const token = await auth.createCustomToken(uid);
+    return { ok: true, token, created, linkedFrom: kind };
+  }
+
+  return { linkClientAccount };
+}
+
+function getLinkCore() {
+  const admin = getAdmin();
+  return { core: createLinkCore({ db: admin.database(), auth: admin.auth() }) };
+}
+
+function makeLinkClientAccount({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.linkClientAccount({ uid: request.auth && request.auth.uid });
+    } catch (e) {
+      if (e instanceof LinkError) throw new HttpsError(e.code, e.message);
+      console.error('[liaison de compte] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { createLinkCore, LinkError, getLinkCore, makeLinkClientAccount };
+
+});
+
+
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
@@ -2592,6 +2676,7 @@ const smsGetCore = __require('smsGetCore');
 const otpHandlers = __require('otpHandlers');
 const accountHandlers = __require('accountHandlers');
 const statsHandlers = __require('statsHandlers');
+const linkHandlers = __require('linkHandlers');
 
 module.exports = {
   wrapCallable: adapter.wrapCallable,
@@ -2622,4 +2707,7 @@ module.exports = {
   makeDeleteAccount: accountHandlers.makeDeleteAccount,
   getStatsCore: statsHandlers.getStatsCore,
   makeAdminStats: statsHandlers.makeAdminStats,
+  getLinkCore: linkHandlers.getLinkCore,
+  makeLinkClientAccount: linkHandlers.makeLinkClientAccount,
+  createLinkCore: linkHandlers.createLinkCore,
 };

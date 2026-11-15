@@ -1,9 +1,9 @@
 'use strict';
-// Un SEUL fichier pour les huit fonctions : parrainage, solde de commission, suppression de compte et statistiques de l'admin, retrait du solde de commission.
+// Un SEUL fichier pour les neuf fonctions : parrainage, solde de commission, suppression de compte et statistiques de l'admin, retrait du solde de commission.
 // Raison : l'offre gratuite (Hobby) de Vercel limite le serveur à 12 fonctions par déploiement,
 // et chaque fichier du dossier api/ compte pour une fonction. Les adresses restent identiques :
 // /api/creditReferral, /api/registerReferral, /api/requestReferralWithdrawal,
-// /api/decideReferralWithdrawal, /api/payCommissionFromBalance, /api/deleteAccount, /api/adminStats, /api/requestCommissionWithdrawal.
+// /api/decideReferralWithdrawal, /api/payCommissionFromBalance, /api/deleteAccount, /api/adminStats, /api/requestCommissionWithdrawal, /api/linkClientAccount.
 // Les fichiers existants (paiement, SMS, notifications...) gardent la priorité sur ce fichier.
 const s = require('../shared');
 
@@ -16,6 +16,7 @@ const routes = {
   deleteAccount: s.wrapCallable(s.makeDeleteAccount, s.getAccountCore),
   adminStats: s.wrapCallable(s.makeAdminStats, s.getStatsCore),
   requestCommissionWithdrawal: s.wrapCallable(s.makeRequestCommissionWithdrawal, s.getPayoutCore),
+  linkClientAccount: s.wrapCallable(s.makeLinkClientAccount, s.getLinkCore),
 };
 
 module.exports = (req, res) => {

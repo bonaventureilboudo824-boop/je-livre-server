@@ -160,12 +160,22 @@ function makeClientNotify(admin) {
   return ({ uid, title, body, data }) => nc.sendToOne({ collection: 'users', uid, title, body, data });
 }
 
+// Adresse où le client revient après avoir payé. L'application Android n'autorise
+// la navigation que vers jelivre.shop : l'ancienne adresse *.web.app ouvrait le
+// navigateur du téléphone au lieu de ramener le client dans Je Livre.
+function safeAppBaseUrl(v) {
+  const d = 'https://jelivre.shop';
+  const u = String(v || '').trim().replace(/\/$/, '');
+  if (!u || /web\.app|firebaseapp\.com/i.test(u)) return d;
+  return u;
+}
+
 function getPaymentCore() {
   const admin = getAdmin();
   const providerName = process.env.PAYMENT_PROVIDER || 'mock';
   const db = admin.database();
   const urls = {
-    appBaseUrl: (process.env.APP_BASE_URL || 'https://je-livre-509fd.web.app').replace(/\/$/, ''),
+    appBaseUrl: safeAppBaseUrl(process.env.APP_BASE_URL),
     webhookUrl: process.env.WEBHOOK_URL || (serverBaseUrl() + '/api/paymentWebhook'),
   };
   const allowedUids = () => (process.env.MOCK_TEST_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -326,7 +336,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
         txId, amount, currency: CURRENCY,
         description: thenPay ? 'Paiement commission Je Livre' : 'Recharge commission Je Livre',
         customer: { uid, phone: driver.phone || '' },
-        returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
+        returnUrl: urls.appBaseUrl + '/?payment=return&k=commission&tx=' + txId,
         notifyUrl: urls.webhookUrl,
       });
     } catch (e) {
@@ -435,7 +445,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
         txId, amount, currency: CURRENCY,
         description: ('Commande Je Livre ' + orderIds.join(', ')).slice(0, 100),
         customer: { uid, phone: orders[0].order.clientPhone || '' },
-        returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
+        returnUrl: urls.appBaseUrl + '/?payment=return&k=marketplace&tx=' + txId,
         notifyUrl: urls.webhookUrl,
       });
     } catch (e) {
@@ -498,7 +508,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
         txId, amount, currency: CURRENCY,
         description: ('Livraison Je Livre ' + deliveryRequestId).slice(0, 100),
         customer: { uid, phone: req.senderPhone || '' },
-        returnUrl: urls.appBaseUrl + '/?payment=return&tx=' + txId,
+        returnUrl: urls.appBaseUrl + '/?payment=return&k=delivery&tx=' + txId,
         notifyUrl: urls.webhookUrl,
       });
     } catch (e) {
@@ -658,7 +668,39 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     }
   }
 
-  return { createPayment, settlePayment, constants: { CURRENCY, MIN_AMOUNT, THROTTLE_MS, LOCK_MS } };
+  // Appelée par l'application au retour de la page de paiement (et à l'ouverture) :
+  // ne dépend plus du webhook. Le serveur redemande l'état réel à HorusPay (serveur à serveur)
+  // puis débloque la commande / la livraison. Sans danger d'être appelée plusieurs fois.
+  const PENDING_STATUSES = ['initiated', 'pending'];
+  async function confirmPayment({ uid, txId }) {
+    if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (txId !== undefined && txId !== null && txId !== '') {
+      if (typeof txId !== 'string' || !TX_ID_RE.test(txId)) throw new PaymentError('invalid-argument', 'Paiement invalide.');
+      const pay = await readVal('payments/' + txId);
+      if (!pay || pay.clientUid !== uid) throw new PaymentError('not-found', 'Paiement introuvable.');
+      const r = await settlePayment(txId);
+      const after = await readVal('payments/' + txId);
+      return { txId, status: (after && after.status) || pay.status, ok: !!(r && r.ok) };
+    }
+    // Sans identifiant : on rattrape les paiements récents de ce compte restés en attente.
+    const snap = await db.ref('payments').orderByChild('clientUid').equalTo(uid).once('value');
+    const all = snap.val() || {};
+    const since = now() - 7 * 24 * 3600 * 1000;
+    const ids = Object.keys(all)
+      .filter((id) => TX_ID_RE.test(id) && all[id] && PENDING_STATUSES.includes(all[id].status) && all[id].providerRef && (all[id].createdAt || 0) > since)
+      .sort((a, b) => (all[b].createdAt || 0) - (all[a].createdAt || 0)).slice(0, 10);
+    const settled = [];
+    for (const id of ids) {
+      try {
+        await settlePayment(id);
+        const after = await readVal('payments/' + id);
+        if (after && FINAL_STATUSES.includes(after.status)) settled.push({ txId: id, status: after.status });
+      } catch (e) { console.error('[paiement] rattrapage impossible', id, e && e.message); }
+    }
+    return { checked: ids.length, settled };
+  }
+
+  return { createPayment, settlePayment, confirmPayment, constants: { CURRENCY, MIN_AMOUNT, THROTTLE_MS, LOCK_MS } };
 }
 
 module.exports = { createPaymentCore, PaymentError };
@@ -1197,6 +1239,19 @@ function makeCreatePayment({ getCore, HttpsError }) {
   };
 }
 
+function makeConfirmPayment({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.confirmPayment({ uid: request.auth && request.auth.uid, txId: request.data && request.data.txId });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[paiement] confirmPayment inattendu', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
 // Le prestataire appelle cette adresse quand un paiement change d'état.
 // 200 pour tout cas traité (même "inconnu", pour éviter des renvois inutiles) ;
 // 500 seulement pour une erreur temporaire de notre côté : le prestataire réessaiera.
@@ -1232,7 +1287,7 @@ function makeMockPay({ getCore }) {
   };
 }
 
-module.exports = { makeCreatePayment, makeWebhook, makeMockPay };
+module.exports = { makeCreatePayment, makeConfirmPayment, makeWebhook, makeMockPay };
 
 });
 
@@ -2705,6 +2760,8 @@ module.exports = {
   wrapRaw: adapter.wrapRaw,
   getPaymentCore: paymentGetCore.getPaymentCore,
   makeCreatePayment: paymentHandlers.makeCreatePayment,
+  makeConfirmPayment: paymentHandlers.makeConfirmPayment,
+  createPaymentCore: __require("paymentCore").createPaymentCore,
   makeWebhook: paymentHandlers.makeWebhook,
   makeMockPay: paymentHandlers.makeMockPay,
   getPayoutCore: paymentGetCore.getPayoutCore,

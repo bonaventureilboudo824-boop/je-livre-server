@@ -16,6 +16,7 @@ const routes = {
   deleteAccount: s.wrapCallable(s.makeDeleteAccount, s.getAccountCore),
   adminStats: s.wrapCallable(s.makeAdminStats, s.getStatsCore),
   requestCommissionWithdrawal: s.wrapCallable(s.makeRequestCommissionWithdrawal, s.getPayoutCore),
+  confirmPayment: s.wrapCallable(s.makeConfirmPayment, s.getPaymentCore),
   linkClientAccount: s.wrapCallable(s.makeLinkClientAccount, s.getLinkCore),
 };
 

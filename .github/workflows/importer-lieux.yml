@@ -1,0 +1,44 @@
+name: Importer les lieux du Burkina (GeoNames) dans Je Livre
+
+# Charge data/places-bf.json dans le noeud "places" (lecture publique, ecriture admin).
+# Les lieux corriges a la main (fixed = true) ou ajoutes par l'admin (ids "a_...") ne sont JAMAIS ecrases.
+# Peut etre relance sans danger.
+on:
+  workflow_dispatch:
+
+jobs:
+  importer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Installer firebase-admin
+        run: npm install --no-audit --no-fund firebase-admin@12
+      - name: Importer
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          cat > importer.js <<'EOS'
+          const admin = require('firebase-admin');
+          const data = require('./data/places-bf.json');
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SA)),
+            databaseURL: 'https://je-livre-509fd-default-rtdb.europe-west1.firebasedatabase.app',
+          });
+          (async () => {
+            const db = admin.database();
+            const existing = (await db.ref('places').once('value')).val() || {};
+            const ids = Object.keys(data).filter((id) => !(existing[id] && existing[id].fixed === true));
+            let n = 0;
+            for (let i = 0; i < ids.length; i += 500) {
+              const upd = {};
+              ids.slice(i, i + 500).forEach((id) => { upd['places/' + id] = data[id]; });
+              await db.ref().update(upd); n += Object.keys(upd).length;
+            }
+            console.log('Lieux importes : ' + n + ' | proteges (corriges a la main) : ' + (Object.keys(data).length - ids.length));
+            process.exit(0);
+          })().catch((e) => { console.error('ERREUR : ' + e.message); process.exit(1); });
+          EOS
+          node importer.js

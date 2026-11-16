@@ -528,6 +528,43 @@
           ".validate": "newData.isString()"
         }
       }
+    },
+    "places": {
+      ".read": true,
+      ".indexOn": [
+        "k"
+      ],
+      "$id": {
+        ".write": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+        ".validate": "!newData.exists() || (newData.hasChildren(['n','k','lat','lng']) && newData.child('n').isString() && newData.child('n').val().length > 0 && newData.child('n').val().length <= 80 && newData.child('k').isString() && newData.child('k').val().length <= 80 && newData.child('lat').isNumber() && newData.child('lat').val() >= 9 && newData.child('lat').val() <= 15.5 && newData.child('lng').isNumber() && newData.child('lng').val() >= -5.7 && newData.child('lng').val() <= 2.5)",
+        "n": {
+          ".validate": "newData.isString()"
+        },
+        "k": {
+          ".validate": "newData.isString()"
+        },
+        "lat": {
+          ".validate": "newData.isNumber()"
+        },
+        "lng": {
+          ".validate": "newData.isNumber()"
+        },
+        "t": {
+          ".validate": "newData.isString() && newData.val().length <= 40"
+        },
+        "s": {
+          ".validate": "newData.isString() && newData.val().length <= 20"
+        },
+        "o": {
+          ".validate": "newData.isNumber()"
+        },
+        "fixed": {
+          ".validate": "newData.isBoolean()"
+        },
+        "at": {
+          ".validate": "newData.isNumber()"
+        }
+      }
     }
   }
 }

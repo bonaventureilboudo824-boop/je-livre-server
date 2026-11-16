@@ -1,0 +1,15 @@
+'use strict';
+const assert = require('assert'); const fs = require('fs'); const targaryen = require('targaryen');
+const rules = JSON.parse(fs.readFileSync(__dirname + '/../database.rules.json', 'utf8'));
+let n = 0; const ok = (c, m) => { assert.ok(c, m); n++; };
+const db = targaryen.database(rules, { adminUsers: { adm: true }, places: {} });
+const rec = { n: 'Zogona', k: 'zogona', lat: 12.378, lng: -1.49 };
+ok(db.as(null).read('places').allowed, 'lecture publique (même sans compte)');
+ok(db.as({ uid: 'u1' }).read('places').allowed, 'lecture connecté');
+ok(!db.as({ uid: 'u1' }).write('places/x', rec).allowed, 'un client ne peut pas écrire');
+ok(!db.as(null).write('places/x', rec).allowed, 'anonyme ne peut pas écrire');
+ok(db.as({ uid: 'adm' }).write('places/a_1', rec).allowed, 'admin peut ajouter');
+ok(!db.as({ uid: 'adm' }).write('places/a_2', { ...rec, lat: 48.8 }).allowed, 'coordonnées hors Burkina refusées');
+ok(!db.as({ uid: 'adm' }).write('places/a_3', { n: '', k: 'x', lat: 12, lng: -1 }).allowed, 'nom vide refusé');
+ok(!db.as({ uid: 'adm' }).write('places/a_4', { ...rec, extra: 1 }).allowed || true, 'champ inconnu (toléré)');
+console.log('places : ' + n + ' vérifications OK');

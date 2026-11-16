@@ -1633,7 +1633,34 @@ function createNotifyCore({ db, messaging, now = () => Date.now() }) {
     return { ok: true, sent: results.filter((r) => r.sent).length, total: results.length };
   }
 
-  return { notifyShopNewOrder, notifyNearbyRequest, sendToOne };
+  // Appelée par le livreur juste après avoir accepté : prévient (une seule fois) celui qui a fait la demande,
+  // et la boutique pour une commande, pour qu'ils sachent qu'un livreur arrive. Le serveur relit la vraie demande.
+  async function notifyAssigned({ callerUid, kind, requestId }) {
+    if (!callerUid) throw new PaymentError('unauthenticated', 'Connexion requise.');
+    if (kind !== 'delivery' && kind !== 'order') throw new PaymentError('invalid-argument', 'Type de demande invalide.');
+    if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{3,60}$/.test(requestId)) throw new PaymentError('invalid-argument', 'Identifiant invalide.');
+    const isDelivery = kind === 'delivery';
+    const collection = isDelivery ? 'deliveryRequests' : 'marketplaceOrders';
+    const req = await readVal(collection + '/' + requestId);
+    if (!req) throw new PaymentError('not-found', 'Demande introuvable.');
+    if (req.assignedDriverId !== callerUid || req.status !== 'assigned') throw new PaymentError('permission-denied', "Cette demande ne vous est pas assignée.");
+    if (req.assignNotifiedAt) return { ok: true, sent: 0, already: true };
+    await db.ref(collection + '/' + requestId + '/assignNotifiedAt').set(now());
+    const who = req.assignedDriverName ? req.assignedDriverName : 'Un livreur';
+    const jobs = [sendToOne({
+      collection: 'users', uid: req.clientUid,
+      title: 'Un livreur arrive',
+      body: who + (isDelivery ? ' a accepté votre livraison. Gardez vos codes pour la remise.' : ' a accepté votre commande. Gardez votre code pour la remise.'),
+      data: { type: 'assigned', kind, requestId },
+    })];
+    if (!isDelivery && req.shopId) {
+      jobs.push(sendToOne({ collection: 'shops', uid: req.shopId, title: 'Un livreur vient chercher la commande', body: 'Donnez-lui votre code de récupération (dans Commandes) quand il arrive.', data: { type: 'assigned', kind, requestId } }));
+    }
+    const res = await Promise.all(jobs);
+    return { ok: true, sent: res.filter((r) => r.sent).length };
+  }
+
+  return { notifyShopNewOrder, notifyNearbyRequest, notifyAssigned, sendToOne };
 }
 
 module.exports = { createNotifyCore, haversineKm };
@@ -1679,7 +1706,24 @@ function makeNotifyNearbyRequest({ getCore, HttpsError }) {
   };
 }
 
-module.exports = { makeNotifyShopNewOrder, makeNotifyNearbyRequest };
+function makeNotifyAssigned({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.notifyAssigned({
+        callerUid: request.auth && request.auth.uid,
+        kind: request.data && request.data.kind,
+        requestId: request.data && request.data.requestId,
+      });
+    } catch (e) {
+      if (e instanceof PaymentError) throw new HttpsError(e.code, e.message);
+      console.error('[notification] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { makeNotifyShopNewOrder, makeNotifyNearbyRequest, makeNotifyAssigned };
 
 });
 
@@ -2761,7 +2805,7 @@ const ID_RE = /^[-A-Za-z0-9_]{1,60}$/;
 //   - code de récupération : connu de celui qui a fait la demande ; le livreur le reçoit en main propre au moment de prendre le colis ;
 //   - code de livraison    : celui qui a fait la demande le transmet au destinataire, qui le donne au livreur à la remise.
 // Seul le serveur marque le colis comme récupéré / livré, quand le bon code est saisi par le livreur assigné.
-function createHandoverCore({ db, now, randomInt }) {
+function createHandoverCore({ db, now, randomInt, notify }) {
   const clock = now || Date.now;
   const rnd = randomInt || ((n) => require('crypto').randomInt(n));
   const val = async (p) => (await db.ref(p).once('value')).val();
@@ -2842,6 +2886,18 @@ function createHandoverCore({ db, now, randomInt }) {
       if (completed) { updates[base + 'status'] = newStatus; updates[base + 'deliveredAt'] = t; }
     } else if (completed) { updates[base + 'status'] = 'completed'; updates[base + 'completedAt'] = t; updates[base + 'deliveredAt'] = t; }
     await db.ref().update(updates);
+    if (notify) {
+      // Best effort : une notification qui échoue ne doit jamais annuler la validation.
+      try {
+        const who = isOrder ? 'commande' : 'colis';
+        let msg = null;
+        if (step === 'pickup') msg = { title: 'Récupéré par le livreur', body: 'Votre ' + who + ' est en route.' };
+        else if (isOrder && newStatus === 'awaiting_payment') msg = { title: 'Commande remise', body: 'Réglez-la maintenant dans « Mes commandes » pour terminer la livraison.' };
+        else if (isOrder) msg = { title: 'Commande remise', body: 'Confirmez la réception dans « Mes commandes ».' };
+        else msg = { title: 'Colis livré ✓', body: 'Votre colis a bien été remis au destinataire.' };
+        await notify({ collection: 'users', uid: r.clientUid, title: msg.title, body: msg.body, data: { type: 'handover', step, id: requestId } });
+      } catch (e) { console.warn('[codes de remise] notification non envoyée', e && e.message); }
+    }
     return { ok: true, step, completed, status: completed ? newStatus : undefined };
   }
 
@@ -2850,7 +2906,8 @@ function createHandoverCore({ db, now, randomInt }) {
 
 function getHandoverCore() {
   const admin = getAdmin();
-  return { core: createHandoverCore({ db: admin.database() }) };
+  const nc = __require('notifyCore').createNotifyCore({ db: admin.database(), messaging: admin.messaging() });
+  return { core: createHandoverCore({ db: admin.database(), notify: (m) => nc.sendToOne(m) }) };
 }
 
 const wrap = (fn) => ({ getCore, HttpsError }) => async (request) => {
@@ -2900,6 +2957,7 @@ module.exports = {
   getNotifyCore: paymentGetCore.getNotifyCore,
   makeNotifyShopNewOrder: notifyHandlers.makeNotifyShopNewOrder,
   makeNotifyNearbyRequest: notifyHandlers.makeNotifyNearbyRequest,
+  makeNotifyAssigned: notifyHandlers.makeNotifyAssigned,
   getReferralCore: paymentGetCore.getReferralCore,
   makeCreditReferral: referralHandlers.makeCreditReferral,
   makeRegisterReferral: referralHandlers.makeRegisterReferral,
@@ -2922,6 +2980,7 @@ module.exports = {
   getHandoverCore: handoverHandlers.getHandoverCore,
   makeGetHandoverCodes: handoverHandlers.makeGetHandoverCodes,
   makeConfirmHandover: handoverHandlers.makeConfirmHandover,
+  createNotifyCore: __require("notifyCore").createNotifyCore,
   createHandoverCore: handoverHandlers.createHandoverCore,
   makeTicket: __require('tickets').makeTicket, TICKET_RE: __require('tickets').TICKET_RE,
 };

@@ -3,7 +3,7 @@
 const assert = require('assert');
 const handler = require('../api/[fn].js');
 const NAMES = ['creditReferral', 'registerReferral', 'requestReferralWithdrawal', 'decideReferralWithdrawal', 'payCommissionFromBalance', 'deleteAccount', 'adminStats',
-  'requestCommissionWithdrawal', 'linkClientAccount', 'confirmPayment', 'driverPayout', 'notifyShopNewOrder', 'notifyNearbyRequest', 'handoverCodes', 'confirmHandover'];
+  'requestCommissionWithdrawal', 'linkClientAccount', 'confirmPayment', 'driverPayout', 'notifyShopNewOrder', 'notifyNearbyRequest', 'notifyAssigned', 'handoverCodes', 'confirmHandover'];
 let n = 0;
 for (const name of NAMES) {
   let status = null; const headers = {};

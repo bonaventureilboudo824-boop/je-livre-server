@@ -1344,6 +1344,9 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
       await db.ref('withdrawalRequests/' + withdrawalId).update({
         lastError: String(e && e.message).slice(0, 1000), lastErrorAt: now(),
       });
+      if (/exceeds available balance/i.test(String(e && e.message))) {
+        throw new PaymentError('failed-precondition', "Solde HorusPay disponible insuffisant pour ce virement. L'argent encaissé auprès des clients n'est peut-être pas encore libéré : vérifiez « Solde » dans HorusPay, puis réessayez. Aucun argent n'a été envoyé.");
+      }
       throw new PaymentError('unavailable', "Le virement n'a pas pu être initié. Réessayez dans un instant.");
     }
 

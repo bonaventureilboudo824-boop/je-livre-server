@@ -123,6 +123,9 @@
         },
         "status": {
           ".validate": "(data.exists() || newData.parent().child('paymentMethod').val() !== 'online' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()) && (data.val() !== 'awaiting_payment' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists())"
+        },
+        "ticket": {
+          ".validate": "(!newData.exists() || (newData.isString() && newData.val().matches(/^LIV-[0-9]{6}-[A-HJ-NP-Z2-9]{6}$/))) && (!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists())"
         }
       }
     },
@@ -163,6 +166,9 @@
         },
         "assignedDriverId": {
           ".validate": "newData.val() === data.val() || (newData.val() === auth.uid && root.child('drivers').child(auth.uid).exists()) || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "ticket": {
+          ".validate": "(!newData.exists() || (newData.isString() && newData.val().matches(/^CMD-[0-9]{6}-[A-HJ-NP-Z2-9]{6}$/))) && (!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists())"
         }
       }
     },
@@ -498,6 +504,28 @@
           "at": {
             ".validate": "newData.val() === now"
           }
+        }
+      }
+    },
+    "tickets": {
+      ".read": "auth != null && root.child('adminUsers').child(auth.uid).exists()",
+      "$ticket": {
+        ".write": "auth != null && ((!data.exists() && newData.child('uid').val() === auth.uid) || root.child('adminUsers').child(auth.uid).exists())",
+        ".validate": "$ticket.matches(/^(LIV|CMD)-[0-9]{6}-[A-HJ-NP-Z2-9]{6}$/) && newData.hasChildren(['kind','id','uid']) && newData.child('kind').isString() && newData.child('id').isString() && newData.child('id').val().length < 60 && newData.child('uid').isString()",
+        "$other": {
+          ".validate": "false"
+        },
+        "at": {
+          ".validate": "newData.isNumber()"
+        },
+        "kind": {
+          ".validate": "newData.val() === 'delivery' || newData.val() === 'order'"
+        },
+        "id": {
+          ".validate": "newData.isString()"
+        },
+        "uid": {
+          ".validate": "newData.isString()"
         }
       }
     }

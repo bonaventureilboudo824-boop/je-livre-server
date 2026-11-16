@@ -2767,9 +2767,11 @@ function createHandoverCore({ db, now, randomInt }) {
   const val = async (p) => (await db.ref(p).once('value')).val();
   const newCode = () => String(rnd(10000)).padStart(4, '0');
 
-  async function loadRequest(requestId) {
+  // kind 'order' : commande boutique (code de récupération donné par la boutique, code de remise donné par le client).
+  const colOf = (kind) => (kind === 'order' ? 'marketplaceOrders' : 'deliveryRequests');
+  async function loadRequest(requestId, kind) {
     if (typeof requestId !== 'string' || !ID_RE.test(requestId)) throw new HandoverError('invalid-argument', 'Livraison invalide.');
-    const r = await val('deliveryRequests/' + requestId);
+    const r = await val(colOf(kind) + '/' + requestId);
     if (!r) throw new HandoverError('not-found', 'Livraison introuvable.');
     if (r.handover !== true) throw new HandoverError('failed-precondition', "Cette livraison n'utilise pas les codes de remise.");
     return r;
@@ -2782,22 +2784,33 @@ function createHandoverCore({ db, now, randomInt }) {
   }
 
   // Pour celui qui a fait la demande : ses deux codes.
-  async function getHandoverCodes({ uid, requestId }) {
+  async function getHandoverCodes({ uid, requestId, kind }) {
     if (!uid) throw new HandoverError('unauthenticated', 'Connexion requise.');
-    const r = await loadRequest(requestId);
+    const r = await loadRequest(requestId, kind);
+    if (kind === 'order') {
+      const isShop = r.shopId === uid, isClient = r.clientUid === uid;
+      if (!isShop && !isClient) throw new HandoverError('permission-denied', "Cette commande ne vous appartient pas.");
+      const oc = await ensureCodes(requestId, r.clientUid);
+      const out = { role: isShop ? 'shop' : 'client', pickedUp: !!r.pickedUpAt, completed: ['delivered', 'awaiting_payment', 'completed'].includes(r.status) };
+      if (isShop) out.pickup = oc.pickup;
+      if (isClient) out.delivery = oc.delivery;
+      return out;
+    }
     if (r.clientUid !== uid) throw new HandoverError('permission-denied', "Cette livraison ne vous appartient pas.");
     const codes = await ensureCodes(requestId, r.clientUid);
     return { pickup: codes.pickup, delivery: codes.delivery, hasRecipient: !!r.recipientCoords, pickedUp: !!r.pickedUpAt, completed: r.status === 'completed' };
   }
 
   // Pour le livreur assigné : valide la récupération ('pickup') ou la remise au destinataire ('delivery').
-  async function confirmHandover({ uid, requestId, step, code }) {
+  async function confirmHandover({ uid, requestId, step, code, kind }) {
     if (!uid) throw new HandoverError('unauthenticated', 'Connexion requise.');
     if (step !== 'pickup' && step !== 'delivery') throw new HandoverError('invalid-argument', 'Étape invalide.');
     const entered = String(code == null ? '' : code).trim();
     if (!/^[0-9]{4}$/.test(entered)) throw new HandoverError('invalid-argument', 'Entrez le code à 4 chiffres.');
-    const r = await loadRequest(requestId);
+    const r = await loadRequest(requestId, kind);
     if (r.assignedDriverId !== uid) throw new HandoverError('permission-denied', "Cette livraison ne vous est pas assignée.");
+    const isOrder = kind === 'order';
+    if (isOrder && ['delivered', 'awaiting_payment', 'completed'].includes(r.status)) return { ok: true, already: true, step, completed: true, status: r.status };
     if (r.status === 'completed') return { ok: true, already: true, step, completed: true };
     if (r.status !== 'assigned') throw new HandoverError('failed-precondition', "Cette livraison n'est plus en cours.");
     const codes = await ensureCodes(requestId, r.clientUid);
@@ -2813,17 +2826,23 @@ function createHandoverCore({ db, now, randomInt }) {
     }
     const t = clock();
     const updates = {};
-    const base = 'deliveryRequests/' + requestId + '/';
+    const base = colOf(kind) + '/' + requestId + '/';
     let completed = false;
+    let newStatus = 'completed';
     if (step === 'pickup') {
       updates[base + 'pickedUpAt'] = t;
-      if (!r.recipientCoords) { completed = true; } // pas de destinataire (ex. collecte groupée) : la récupération termine la course
+      if (!isOrder && !r.recipientCoords) { completed = true; } // pas de destinataire (ex. collecte groupée) : la récupération termine la course
     } else {
       completed = true;
     }
-    if (completed) { updates[base + 'status'] = 'completed'; updates[base + 'completedAt'] = t; updates[base + 'deliveredAt'] = t; }
+    if (isOrder) {
+      // Commande boutique : le serveur la passe en « livrée » (le client confirme la réception ensuite),
+      // ou en « attente de paiement » si le client règle à la remise.
+      newStatus = (r.paymentMethod === 'pay_on_delivery' && r.paymentStatus !== 'paid') ? 'awaiting_payment' : 'delivered';
+      if (completed) { updates[base + 'status'] = newStatus; updates[base + 'deliveredAt'] = t; }
+    } else if (completed) { updates[base + 'status'] = 'completed'; updates[base + 'completedAt'] = t; updates[base + 'deliveredAt'] = t; }
     await db.ref().update(updates);
-    return { ok: true, step, completed };
+    return { ok: true, step, completed, status: completed ? newStatus : undefined };
   }
 
   return { getHandoverCodes, confirmHandover };
@@ -2844,8 +2863,8 @@ const wrap = (fn) => ({ getCore, HttpsError }) => async (request) => {
     throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
   }
 };
-const makeGetHandoverCodes = wrap((core, { uid, data }) => core.getHandoverCodes({ uid, requestId: data.requestId }));
-const makeConfirmHandover = wrap((core, { uid, data }) => core.confirmHandover({ uid, requestId: data.requestId, step: data.step, code: data.code }));
+const makeGetHandoverCodes = wrap((core, { uid, data }) => core.getHandoverCodes({ uid, requestId: data.orderId || data.requestId, kind: data.orderId ? 'order' : 'request' }));
+const makeConfirmHandover = wrap((core, { uid, data }) => core.confirmHandover({ uid, requestId: data.orderId || data.requestId, step: data.step, code: data.code, kind: data.orderId ? 'order' : 'request' }));
 
 module.exports = { createHandoverCore, HandoverError, getHandoverCore, makeGetHandoverCodes, makeConfirmHandover };
 

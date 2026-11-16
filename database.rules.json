@@ -168,7 +168,7 @@
           ".validate": "newData.val() === data.val() || newData.val() !== 'paid' || newData.parent().child('paymentMethod').val() === 'cash' || root.child('adminUsers').child(auth.uid).exists()"
         },
         "status": {
-          ".validate": "(data.exists() || newData.parent().child('paymentMethod').val() !== 'online' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()) && (data.val() !== 'awaiting_payment' || newData.val() === 'awaiting_payment' || newData.val() === 'cancelled' || root.child('adminUsers').child(auth.uid).exists()) && (newData.val() !== 'cancelled' || newData.parent().child('paymentMethod').val() !== 'online' || newData.parent().child('paymentStatus').val() !== 'paid' || root.child('adminUsers').child(auth.uid).exists())"
+          ".validate": "((data.exists() || newData.parent().child('paymentMethod').val() !== 'online' || newData.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()) && (data.val() !== 'awaiting_payment' || newData.val() === 'awaiting_payment' || newData.val() === 'cancelled' || root.child('adminUsers').child(auth.uid).exists()) && (newData.val() !== 'cancelled' || newData.parent().child('paymentMethod').val() !== 'online' || newData.parent().child('paymentStatus').val() !== 'paid' || root.child('adminUsers').child(auth.uid).exists())) && (!data.exists() || data.parent().child('handover').val() !== true || ((newData.val() !== 'delivered' && newData.val() !== 'awaiting_payment') || data.val() === newData.val() || root.child('adminUsers').child(auth.uid).exists()) && (newData.val() !== 'completed' || data.val() === 'completed' || data.val() === 'delivered' || data.val() === 'awaiting_payment' || root.child('adminUsers').child(auth.uid).exists()))"
         },
         "clientUid": {
           ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
@@ -178,6 +178,15 @@
         },
         "ticket": {
           ".validate": "(!newData.exists() || (newData.isString() && newData.val().matches(/^CMD-[0-9]{6}-[A-HJ-NP-Z2-9]{6}$/))) && (!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists())"
+        },
+        "handover": {
+          ".validate": "newData.isBoolean() && (data.exists() ? newData.val() === data.val() : newData.val() === true) || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "pickedUpAt": {
+          ".validate": "newData.val() === data.val() || data.parent().child('handover').val() !== true || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "deliveredAt": {
+          ".validate": "newData.val() === data.val() || data.parent().child('handover').val() !== true || root.child('adminUsers').child(auth.uid).exists()"
         }
       }
     },

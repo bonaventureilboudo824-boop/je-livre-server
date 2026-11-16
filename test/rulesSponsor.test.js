@@ -36,3 +36,20 @@ ok(!d.as(U('v1')).write('sponsorStats/act/abc/views', 1).allowed, 'jour invalide
 ok(d.as(U('u1')).read('sponsorStats/act').allowed, 'le propriétaire lit ses stats');
 ok(!d.as(U('v1')).read('sponsorStats/act').allowed, "les autres ne lisent pas");
 console.log('rulesSponsor : ' + n + ' vérifications OK');
+// --- Compte de paiement du livreur ---
+{
+  const d2 = targaryen.database(rules, { adminUsers: { a1: true }, driverPayoutAccounts: { d1: { network: 'moov_bf', phone: '70123456', holderName: 'Issa K' } } });
+  const U2 = (uid) => ({ uid });
+  const acc = { network: 'orange_bf_direct', phone: '70123456', holderName: 'Issa Kaboré', updatedAt: 5 };
+  let m = 0; const ok2 = (c, msg) => { assert.ok(c, msg); m++; };
+  ok2(d2.as(U2('d1')).write('driverPayoutAccounts/d1', acc).allowed, 'le livreur enregistre son compte');
+  ok2(!d2.as(U2('d9')).write('driverPayoutAccounts/d1', acc).allowed, "personne d'autre ne le change");
+  ok2(!d2.as(U2('d9')).read('driverPayoutAccounts/d1').allowed, 'ni ne le lit');
+  ok2(d2.as(U2('d1')).read('driverPayoutAccounts/d1').allowed, 'le livreur le lit');
+  ok2(d2.as(U2('a1')).read('driverPayoutAccounts/d1').allowed, "l'admin le lit");
+  ok2(!d2.as(U2('d1')).write('driverPayoutAccounts/d1', { ...acc, network: 'wave' }).allowed, 'réseau inconnu refusé');
+  ok2(!d2.as(U2('d1')).write('driverPayoutAccounts/d1', { ...acc, phone: '+22670123456' }).allowed, 'numéro à 8 chiffres uniquement');
+  ok2(!d2.as(U2('d1')).write('driverPayoutAccounts/d1', { ...acc, holderName: 'X' }).allowed, 'nom trop court');
+  ok2(!d2.as(U2('d1')).write('driverPayoutAccounts/d1', { network: 'moov_bf', phone: '70123456' }).allowed, 'nom obligatoire');
+  console.log('rulesPayoutAccount : ' + m + ' vérifications OK');
+}

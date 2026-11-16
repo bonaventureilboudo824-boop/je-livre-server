@@ -1419,7 +1419,7 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
 
     let payout;
     try {
-      payout = await provider.createPayout({ amount: w.amount, currency: 'XOF', mode: w.network, phone: w.phone });
+      payout = await provider.createPayout({ amount: w.amount, currency: 'XOF', mode: w.network, phone: w.phone, holderName: w.holderName });
     } catch (e) {
       await db.ref('withdrawalRequests/' + withdrawalId).update({
         lastError: String(e && e.message).slice(0, 1000), lastErrorAt: now(),
@@ -1447,19 +1447,27 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
   // Garde-fous : seulement l'excédent qui ne sert pas à couvrir la commission en attente,
   // virement UNIQUEMENT sur le numéro enregistré du livreur, plafond par jour,
   // et remboursement automatique si le virement échoue.
-  async function runCommissionWithdrawal({ uid, amount, network }) {
+  async function runCommissionWithdrawal({ uid, amount, network: networkArg }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
     if (!Number.isInteger(amount) || amount < WITHDRAW_MIN || amount > WITHDRAW_DAILY_MAX) {
       throw new PaymentError('invalid-argument', 'Montant invalide (entre ' + WITHDRAW_MIN + ' et ' + WITHDRAW_DAILY_MAX + ' F).');
     }
-    if (!VALID_MODES.includes(network)) throw new PaymentError('invalid-argument', 'Réseau Mobile Money invalide.');
     const driver = await readVal('drivers/' + uid);
     if (!driver) throw new PaymentError('not-found', 'Compte livreur introuvable.');
     if (!driver.approved) throw new PaymentError('failed-precondition', "Votre compte livreur n'est pas encore validé.");
-    const phone = String(driver.phone || '').trim();
-    if (!/^\+?\d[\d\s]{6,14}$/.test(phone)) {
-      throw new PaymentError('failed-precondition', "Aucun numéro Mobile Money valide n'est enregistré sur votre compte. Contactez-nous.");
+    // Compte de paiement enregistré par le livreur (réseau + numéro + nom du titulaire) : c'est lui qui décide
+    // de la destination du virement, jamais la demande. À défaut (anciennes versions de l'appli), numéro du compte.
+    const acct = await readVal('driverPayoutAccounts/' + uid);
+    let network = networkArg, phone, holderName = null;
+    if (acct && VALID_MODES.includes(acct.network) && /^[0-9]{8}$/.test(String(acct.phone || ''))) {
+      network = acct.network; phone = '+226' + acct.phone; holderName = String(acct.holderName || '').slice(0, 60) || null;
+    } else {
+      phone = String(driver.phone || '').trim();
+      if (!/^\+?\d[\d\s]{6,14}$/.test(phone)) {
+        throw new PaymentError('failed-precondition', "Enregistrez d'abord votre compte de paiement (réseau, numéro et nom) dans votre espace livreur.");
+      }
     }
+    if (!VALID_MODES.includes(network)) throw new PaymentError('invalid-argument', 'Réseau Mobile Money invalide.');
     const throttle = await db.ref('withdrawThrottle/' + uid).transaction((cur) => (typeof cur === 'number' && now() - cur < WITHDRAW_THROTTLE_MS ? undefined : now()));
     if (!throttle.committed) throw new PaymentError('resource-exhausted', 'Veuillez patienter quelques secondes avant de réessayer.');
 
@@ -1492,14 +1500,14 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
     const { makeTicket } = require('tickets');
     const id = 'w_' + now().toString(36) + Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, '0');
     try {
-      await db.ref('withdrawalRequests/' + id).set({ kind: 'commissionBalance', ticket: makeTicket('RET', now(), Math.random), driverId: uid, amount, phone, network, status: 'initiating', debited: true, requestedAt: now() });
+      await db.ref('withdrawalRequests/' + id).set({ kind: 'commissionBalance', ticket: makeTicket('RET', now(), Math.random), driverId: uid, holderName, amount, phone, network, status: 'initiating', debited: true, requestedAt: now() });
     } catch (e) {
       await refund(amount); await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
       throw new PaymentError('unavailable', "Le retrait n'a pas pu être enregistré. Votre solde n'a pas été débité.");
     }
     let payout;
     try {
-      payout = await provider.createPayout({ amount, currency: 'XOF', mode: network, phone });
+      payout = await provider.createPayout({ amount, currency: 'XOF', mode: network, phone, holderName });
     } catch (e) {
       await refund(amount);
       await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
@@ -2041,7 +2049,10 @@ module.exports = function createHorusPayProvider({ token }) {
     // utilise la même formulation ambiguë (« plus petite unité monétaire »)
     // qui s'est révélée fausse pour le XOF à l'usage. À reconfirmer avec un
     // tout petit retrait réel avant de faire confiance à grande échelle.
-    async createPayout({ amount, currency, mode, phone }) {
+    async createPayout({ amount, currency, mode, phone, holderName }) {
+      const parts = String(holderName || '').trim().split(/\s+/).filter(Boolean);
+      const firstname = parts[0] || 'Livreur';
+      const lastname = parts.slice(1).join(' ') || (parts[0] ? '-' : 'Je Livre');
       const createData = await apiCall('/accounts/payouts', {
         method: 'POST',
         body: {
@@ -2049,8 +2060,8 @@ module.exports = function createHorusPayProvider({ token }) {
           currency,
           mode,
           customer: {
-            firstname: 'Livreur',
-            lastname: 'Je Livre',
+            firstname,
+            lastname,
             email: syntheticEmail(phone),
             country_code: 'BF',
             phone: { number: phone, country: 'bf', network: mode },

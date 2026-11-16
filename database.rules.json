@@ -670,6 +670,28 @@
           }
         }
       }
+    },
+    "driverPayoutAccounts": {
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && (auth.uid === $uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".validate": "newData.hasChildren(['network','phone','holderName'])",
+        "network": {
+          ".validate": "newData.isString() && (newData.val() === 'orange_bf_direct' || newData.val() === 'moov_bf')"
+        },
+        "phone": {
+          ".validate": "newData.isString() && newData.val().matches(/^[0-9]{8}$/)"
+        },
+        "holderName": {
+          ".validate": "newData.isString() && newData.val().length >= 2 && newData.val().length <= 60"
+        },
+        "updatedAt": {
+          ".validate": "newData.isNumber()"
+        },
+        "$other": {
+          ".validate": "false"
+        }
+      }
     }
   }
 }

@@ -241,6 +241,22 @@ module.exports = { getAdmin };
 });
 
 // ---------- lib/paymentCore.js ----------
+__define('tickets', function (module, exports, require) {
+'use strict';
+// Ticket de litige : PREFIXE-AAMMJJ-6 caractères (sans 0/O/1/I). Ex. PAY-261116-K7M2QX.
+const TICKET_RE = /^(LIV|CMD)-[0-9]{6}-[A-HJ-NP-Z2-9]{6}$/;
+const TICKET_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function makeTicket(prefix, ts, rnd) {
+  const d = new Date(ts);
+  const ymd = String(d.getUTCFullYear()).slice(2) + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCDate()).padStart(2, '0');
+  let c = '';
+  for (let i = 0; i < 6; i++) c += TICKET_CHARS[Math.floor(rnd() * TICKET_CHARS.length)];
+  return prefix + '-' + ymd + '-' + c;
+}
+
+module.exports = { makeTicket, TICKET_RE };
+});
+
 __define('paymentCore', function (module, exports, require) {
 'use strict';
 
@@ -273,6 +289,7 @@ const FINAL_STATUSES = ['paid', 'paid_needs_review', 'amount_mismatch'];
 const ORDER_ID_RE = /^CMD-[A-Z0-9]{3,24}$/;
 const TX_ID_RE = /^JL[A-Z0-9]{6,30}$/;
 const DELIVERY_REQUEST_ID_RE = /^dr_[a-z0-9]{3,40}$/;
+const { makeTicket, TICKET_RE } = require('tickets');
 
 function createPaymentCore({ db, provider, providerName, urls, notify = null, now = () => Date.now(), random = Math.random }) {
   const referral = createReferralCore({ db, now, notify });
@@ -299,7 +316,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
 
     const txId = newTxId();
     await db.ref('payments/' + txId).set({
-      txId, clientUid: uid, kind: 'commissionTopup', driverId: uid, amount, currency: CURRENCY,
+      txId, ticket: makeTicket('PAY', now(), random), clientUid: uid, kind: 'commissionTopup', driverId: uid, amount, currency: CURRENCY,
       provider: providerName, status: 'initiated', createdAt: now(),
       ...(thenPay ? { thenPayCommission: true } : {}),
     });
@@ -404,7 +421,9 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     // 3) On enregistre le paiement AVANT d'appeler le prestataire : si sa
     //    confirmation arrive très vite, elle doit trouver le paiement en base.
     updates['payments/' + txId] = {
-      txId, clientUid: uid, orderIds, amount, currency: CURRENCY,
+      txId, ticket: makeTicket('PAY', now(), random), clientUid: uid, orderIds,
+      orderTickets: orders.map((o) => o.order.ticket).filter((t) => typeof t === 'string' && TICKET_RE.test(t)),
+      amount, currency: CURRENCY,
       provider: providerName, status: 'initiated', createdAt: now(),
     };
     await db.ref().update(updates);
@@ -467,7 +486,8 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     updates['deliveryRequests/' + deliveryRequestId + '/distanceKm'] = distanceKm;
     updates['deliveryRequests/' + deliveryRequestId + '/paymentTxId'] = txId;
     updates['payments/' + txId] = {
-      txId, clientUid: uid, kind: 'delivery', requestId: deliveryRequestId, amount, currency: CURRENCY,
+      txId, ticket: makeTicket('PAY', now(), random), clientUid: uid, kind: 'delivery', requestId: deliveryRequestId,
+      deliveryTicket: (typeof req.ticket === 'string' && TICKET_RE.test(req.ticket)) ? req.ticket : null, amount, currency: CURRENCY,
       provider: providerName, status: 'initiated', createdAt: now(),
     };
     await db.ref().update(updates);
@@ -908,6 +928,7 @@ function createReferralCore({ db, notify = null, now = () => Date.now(), random 
   // Le solde est DÉBITÉ ici, au moment de la demande (avant, il n'était jamais débité :
   // on pouvait redemander le même montant). Un refus par l'admin le REMBOURSE.
   async function requestWithdrawal({ uid, amount, phone }) {
+    const { makeTicket } = require('tickets');
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
     if (!Number.isInteger(amount) || amount < minWithdrawal) throw new PaymentError('invalid-argument', 'Montant invalide (minimum ' + minWithdrawal + ' F).');
     const ph = String(phone || '').trim();
@@ -919,7 +940,7 @@ function createReferralCore({ db, notify = null, now = () => Date.now(), random 
     const id = 'w_' + now().toString(36) + Math.floor(random() * 36 ** 5).toString(36).padStart(5, '0');
     try {
       await db.ref('withdrawalRequests/' + id).set({
-        kind: 'referral', debited: true, clientUid: uid, shopName: 'Parrainage — ' + String(user.name || '').slice(0, 60),
+        kind: 'referral', ticket: makeTicket('RET', now(), random), debited: true, clientUid: uid, shopName: 'Parrainage — ' + String(user.name || '').slice(0, 60),
         amount, phone: ph, status: 'pending', requestedAt: now(),
       });
     } catch (e) {
@@ -1330,9 +1351,10 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
       throw new PaymentError('resource-exhausted', 'Plafond de retrait du jour atteint (' + WITHDRAW_DAILY_MAX + ' F par jour).');
     }
     // 3) Enregistrement puis virement.
+    const { makeTicket } = require('tickets');
     const id = 'w_' + now().toString(36) + Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, '0');
     try {
-      await db.ref('withdrawalRequests/' + id).set({ kind: 'commissionBalance', driverId: uid, amount, phone, network, status: 'initiating', debited: true, requestedAt: now() });
+      await db.ref('withdrawalRequests/' + id).set({ kind: 'commissionBalance', ticket: makeTicket('RET', now(), Math.random), driverId: uid, amount, phone, network, status: 'initiating', debited: true, requestedAt: now() });
     } catch (e) {
       await refund(amount); await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
       throw new PaymentError('unavailable', "Le retrait n'a pas pu être enregistré. Votre solde n'a pas été débité.");
@@ -2710,4 +2732,5 @@ module.exports = {
   getLinkCore: linkHandlers.getLinkCore,
   makeLinkClientAccount: linkHandlers.makeLinkClientAccount,
   createLinkCore: linkHandlers.createLinkCore,
+  makeTicket: __require('tickets').makeTicket, TICKET_RE: __require('tickets').TICKET_RE,
 };

@@ -17,6 +17,9 @@ const routes = {
   adminStats: s.wrapCallable(s.makeAdminStats, s.getStatsCore),
   requestCommissionWithdrawal: s.wrapCallable(s.makeRequestCommissionWithdrawal, s.getPayoutCore),
   confirmPayment: s.wrapCallable(s.makeConfirmPayment, s.getPaymentCore),
+  driverPayout: s.wrapCallable(s.makeCreateDriverPayout, s.getPayoutCore),
+  notifyShopNewOrder: s.wrapCallable(s.makeNotifyShopNewOrder, s.getNotifyCore),
+  notifyNearbyRequest: s.wrapCallable(s.makeNotifyNearbyRequest, s.getNotifyCore),
   linkClientAccount: s.wrapCallable(s.makeLinkClientAccount, s.getLinkCore),
 };
 

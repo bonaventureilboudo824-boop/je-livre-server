@@ -20,6 +20,8 @@ const routes = {
   driverPayout: s.wrapCallable(s.makeCreateDriverPayout, s.getPayoutCore),
   notifyShopNewOrder: s.wrapCallable(s.makeNotifyShopNewOrder, s.getNotifyCore),
   notifyNearbyRequest: s.wrapCallable(s.makeNotifyNearbyRequest, s.getNotifyCore),
+  handoverCodes: s.wrapCallable(s.makeGetHandoverCodes, s.getHandoverCore),
+  confirmHandover: s.wrapCallable(s.makeConfirmHandover, s.getHandoverCore),
   linkClientAccount: s.wrapCallable(s.makeLinkClientAccount, s.getLinkCore),
 };
 

@@ -2744,6 +2744,113 @@ module.exports = { createLinkCore, LinkError, getLinkCore, makeLinkClientAccount
 
 });
 
+// ---------- handover.js : codes de remise (récupération / livraison) ----------
+__define('handoverHandlers', function (module, exports, require) {
+'use strict';
+
+const { getAdmin } = require('firebaseAdmin');
+
+class HandoverError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+const MAX_TRIES = 5;
+const ID_RE = /^[-A-Za-z0-9_]{1,60}$/;
+
+// Deux codes à 4 chiffres par livraison, générés et gardés par le serveur (jamais lisibles par le livreur) :
+//   - code de récupération : connu de celui qui a fait la demande ; le livreur le reçoit en main propre au moment de prendre le colis ;
+//   - code de livraison    : celui qui a fait la demande le transmet au destinataire, qui le donne au livreur à la remise.
+// Seul le serveur marque le colis comme récupéré / livré, quand le bon code est saisi par le livreur assigné.
+function createHandoverCore({ db, now, randomInt }) {
+  const clock = now || Date.now;
+  const rnd = randomInt || ((n) => require('crypto').randomInt(n));
+  const val = async (p) => (await db.ref(p).once('value')).val();
+  const newCode = () => String(rnd(10000)).padStart(4, '0');
+
+  async function loadRequest(requestId) {
+    if (typeof requestId !== 'string' || !ID_RE.test(requestId)) throw new HandoverError('invalid-argument', 'Livraison invalide.');
+    const r = await val('deliveryRequests/' + requestId);
+    if (!r) throw new HandoverError('not-found', 'Livraison introuvable.');
+    if (r.handover !== true) throw new HandoverError('failed-precondition', "Cette livraison n'utilise pas les codes de remise.");
+    return r;
+  }
+
+  async function ensureCodes(requestId, clientUid) {
+    const ref = db.ref('deliveryCodes/' + requestId);
+    await ref.transaction((cur) => (cur ? undefined : { pickup: newCode(), delivery: newCode(), pickupTries: 0, deliveryTries: 0, clientUid, createdAt: clock() }));
+    return (await ref.once('value')).val();
+  }
+
+  // Pour celui qui a fait la demande : ses deux codes.
+  async function getHandoverCodes({ uid, requestId }) {
+    if (!uid) throw new HandoverError('unauthenticated', 'Connexion requise.');
+    const r = await loadRequest(requestId);
+    if (r.clientUid !== uid) throw new HandoverError('permission-denied', "Cette livraison ne vous appartient pas.");
+    const codes = await ensureCodes(requestId, r.clientUid);
+    return { pickup: codes.pickup, delivery: codes.delivery, hasRecipient: !!r.recipientCoords, pickedUp: !!r.pickedUpAt, completed: r.status === 'completed' };
+  }
+
+  // Pour le livreur assigné : valide la récupération ('pickup') ou la remise au destinataire ('delivery').
+  async function confirmHandover({ uid, requestId, step, code }) {
+    if (!uid) throw new HandoverError('unauthenticated', 'Connexion requise.');
+    if (step !== 'pickup' && step !== 'delivery') throw new HandoverError('invalid-argument', 'Étape invalide.');
+    const entered = String(code == null ? '' : code).trim();
+    if (!/^[0-9]{4}$/.test(entered)) throw new HandoverError('invalid-argument', 'Entrez le code à 4 chiffres.');
+    const r = await loadRequest(requestId);
+    if (r.assignedDriverId !== uid) throw new HandoverError('permission-denied', "Cette livraison ne vous est pas assignée.");
+    if (r.status === 'completed') return { ok: true, already: true, step, completed: true };
+    if (r.status !== 'assigned') throw new HandoverError('failed-precondition', "Cette livraison n'est plus en cours.");
+    const codes = await ensureCodes(requestId, r.clientUid);
+    const triesKey = step === 'pickup' ? 'pickupTries' : 'deliveryTries';
+    if (step === 'pickup' && r.pickedUpAt) return { ok: true, already: true, step, completed: false };
+    if (step === 'delivery' && !r.pickedUpAt) throw new HandoverError('failed-precondition', "Validez d'abord la récupération du colis.");
+    if ((codes[triesKey] || 0) >= MAX_TRIES) throw new HandoverError('resource-exhausted', 'Trop de codes erronés. Contactez le service client.');
+    if (entered !== String(codes[step])) {
+      const tr = await db.ref('deliveryCodes/' + requestId + '/' + triesKey).transaction((c) => (c || 0) + 1);
+      const used = (tr && tr.snapshot && tr.snapshot.val()) || 1;
+      const left = Math.max(0, MAX_TRIES - used);
+      throw new HandoverError('permission-denied', 'Code incorrect. ' + (left > 0 ? 'Il vous reste ' + left + ' essai(s).' : 'Plus aucun essai : contactez le service client.'));
+    }
+    const t = clock();
+    const updates = {};
+    const base = 'deliveryRequests/' + requestId + '/';
+    let completed = false;
+    if (step === 'pickup') {
+      updates[base + 'pickedUpAt'] = t;
+      if (!r.recipientCoords) { completed = true; } // pas de destinataire (ex. collecte groupée) : la récupération termine la course
+    } else {
+      completed = true;
+    }
+    if (completed) { updates[base + 'status'] = 'completed'; updates[base + 'completedAt'] = t; updates[base + 'deliveredAt'] = t; }
+    await db.ref().update(updates);
+    return { ok: true, step, completed };
+  }
+
+  return { getHandoverCodes, confirmHandover };
+}
+
+function getHandoverCore() {
+  const admin = getAdmin();
+  return { core: createHandoverCore({ db: admin.database() }) };
+}
+
+const wrap = (fn) => ({ getCore, HttpsError }) => async (request) => {
+  try {
+    const { core } = getCore();
+    return await fn(core, { uid: request.auth && request.auth.uid, data: request.data || {} });
+  } catch (e) {
+    if (e instanceof HandoverError) throw new HttpsError(e.code, e.message);
+    console.error('[codes de remise] erreur inattendue', e);
+    throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+  }
+};
+const makeGetHandoverCodes = wrap((core, { uid, data }) => core.getHandoverCodes({ uid, requestId: data.requestId }));
+const makeConfirmHandover = wrap((core, { uid, data }) => core.confirmHandover({ uid, requestId: data.requestId, step: data.step, code: data.code }));
+
+module.exports = { createHandoverCore, HandoverError, getHandoverCore, makeGetHandoverCodes, makeConfirmHandover };
+
+});
+
 
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
@@ -2757,6 +2864,7 @@ const otpHandlers = __require('otpHandlers');
 const accountHandlers = __require('accountHandlers');
 const statsHandlers = __require('statsHandlers');
 const linkHandlers = __require('linkHandlers');
+const handoverHandlers = __require('handoverHandlers');
 
 module.exports = {
   wrapCallable: adapter.wrapCallable,
@@ -2792,5 +2900,9 @@ module.exports = {
   getLinkCore: linkHandlers.getLinkCore,
   makeLinkClientAccount: linkHandlers.makeLinkClientAccount,
   createLinkCore: linkHandlers.createLinkCore,
+  getHandoverCore: handoverHandlers.getHandoverCore,
+  makeGetHandoverCodes: handoverHandlers.makeGetHandoverCodes,
+  makeConfirmHandover: handoverHandlers.makeConfirmHandover,
+  createHandoverCore: handoverHandlers.createHandoverCore,
   makeTicket: __require('tickets').makeTicket, TICKET_RE: __require('tickets').TICKET_RE,
 };

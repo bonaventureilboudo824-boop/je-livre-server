@@ -587,6 +587,89 @@
     "deliveryCodes": {
       ".read": "root.child('adminUsers').child(auth.uid).exists()",
       ".write": "root.child('adminUsers').child(auth.uid).exists()"
+    },
+    "sponsoredReels": {
+      ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || (query.orderByChild == 'status' && query.equalTo == 'active') || (query.orderByChild == 'ownerUid' && query.equalTo == auth.uid))",
+      ".indexOn": [
+        "status",
+        "ownerUid"
+      ],
+      "$sid": {
+        ".read": "auth != null && (data.child('status').val() === 'active' || data.child('ownerUid').val() === auth.uid || root.child('adminUsers').child(auth.uid).exists())",
+        ".write": "auth != null && ((!data.exists() && newData.child('ownerUid').val() === auth.uid) || (data.exists() && data.child('ownerUid').val() === auth.uid && (newData.exists() || data.child('status').val() === 'awaiting_payment')) || root.child('adminUsers').child(auth.uid).exists())",
+        "ownerUid": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "ownerRole": {
+          ".validate": "newData.isString() && (newData.val() === 'client' || newData.val() === 'shop' || newData.val() === 'driver' || newData.val() === 'enterprise') && (!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists())"
+        },
+        "ownerName": {
+          ".validate": "newData.isString() && newData.val().length <= 60"
+        },
+        "ownerPhone": {
+          ".validate": "newData.isString() && newData.val().length <= 30"
+        },
+        "videoUrl": {
+          ".validate": "newData.isString() && newData.val().matches(/^https:\\/\\/.{3,600}$/) && (!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists())"
+        },
+        "linkUrl": {
+          ".validate": "newData.isString() && newData.val().matches(/^https:\\/\\/.{3,500}$/)"
+        },
+        "caption": {
+          ".validate": "newData.isString() && newData.val().length <= 120"
+        },
+        "cities": {
+          ".validate": "newData.hasChildren()",
+          "$i": {
+            ".validate": "newData.isString() && newData.val().length <= 30"
+          }
+        },
+        "createdAt": {
+          ".validate": "!data.exists() || newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "status": {
+          ".validate": "(!data.exists() ? newData.val() === 'awaiting_payment' : newData.val() === data.val()) || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentStatus": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentTxId": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paymentTxAt": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "paidAt": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "startsAt": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "endsAt": {
+          ".validate": "newData.val() === data.val() || root.child('adminUsers').child(auth.uid).exists()"
+        },
+        "$other": {
+          ".validate": "false"
+        }
+      }
+    },
+    "sponsorStats": {
+      "$sid": {
+        ".read": "auth != null && (root.child('adminUsers').child(auth.uid).exists() || root.child('sponsoredReels').child($sid).child('ownerUid').val() === auth.uid)",
+        "$day": {
+          ".validate": "$day.matches(/^[0-9]{8}$/)",
+          ".write": "auth != null && (root.child('sponsoredReels').child($sid).child('status').val() === 'active' || root.child('adminUsers').child(auth.uid).exists())",
+          "views": {
+            ".validate": "newData.isNumber() && (newData.val() === (data.exists() ? data.val() : 0) + 1 || root.child('adminUsers').child(auth.uid).exists())"
+          },
+          "clicks": {
+            ".validate": "newData.isNumber() && (newData.val() === (data.exists() ? data.val() : 0) + 1 || root.child('adminUsers').child(auth.uid).exists())"
+          },
+          "$other": {
+            ".validate": "false"
+          }
+        }
+      }
     }
   }
 }

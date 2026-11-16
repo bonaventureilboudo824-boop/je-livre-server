@@ -299,6 +299,12 @@ const FINAL_STATUSES = ['paid', 'paid_needs_review', 'amount_mismatch'];
 const ORDER_ID_RE = /^CMD-[A-Z0-9]{3,24}$/;
 const TX_ID_RE = /^JL[A-Z0-9]{6,30}$/;
 const DELIVERY_REQUEST_ID_RE = /^dr_[a-z0-9]{3,40}$/;
+// Reels sponsorisés : un tarif unique, 10 jours, 200 en même temps au maximum.
+const SPONSOR_ID_RE = /^sp_[a-z0-9]{3,40}$/;
+const SPONSOR_PRICE = 5000;
+const SPONSOR_DAYS = 10;
+const SPONSOR_MAX_ACTIVE = 200;
+const SPONSOR_HOLD_MS = 30 * 60 * 1000; // une place réservée au moment du paiement est gardée 30 min
 const { makeTicket, TICKET_RE } = require('tickets');
 
 function createPaymentCore({ db, provider, providerName, urls, notify = null, now = () => Date.now(), random = Math.random }) {
@@ -351,7 +357,62 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     return { txId, paymentUrl: checkout.paymentUrl, amount };
   }
 
-  async function createPayment({ uid, orderIds, deliveryRequestId, commissionTopup, payCommission }) {
+  // Places de Reels sponsorisés déjà prises : actifs non expirés + réservations de paiement récentes.
+  async function sponsorSlotsTaken(excludeId) {
+    const t = now();
+    const act = (await db.ref('sponsoredReels').orderByChild('status').equalTo('active').once('value')).val() || {};
+    const wait = (await db.ref('sponsoredReels').orderByChild('status').equalTo('awaiting_payment').once('value')).val() || {};
+    let n = 0;
+    Object.keys(act).forEach((id) => { if (id !== excludeId && act[id] && (act[id].endsAt || 0) > t) n++; });
+    Object.keys(wait).forEach((id) => { if (id !== excludeId && wait[id] && (wait[id].paymentTxAt || 0) > t - SPONSOR_HOLD_MS) n++; });
+    return n;
+  }
+
+  async function createSponsorPayment({ uid, sponsorId }) {
+    if (typeof sponsorId !== 'string' || !SPONSOR_ID_RE.test(sponsorId)) throw new PaymentError('invalid-argument', 'Reel sponsorisé invalide.');
+    const sp = await readVal('sponsoredReels/' + sponsorId);
+    if (!sp) throw new PaymentError('not-found', 'Reel sponsorisé introuvable.');
+    if (sp.ownerUid !== uid) throw new PaymentError('permission-denied', "Ce Reel n'est pas le vôtre.");
+    if (sp.status !== 'awaiting_payment') throw new PaymentError('failed-precondition', 'Ce Reel est déjà payé ou terminé.');
+    if (typeof sp.videoUrl !== 'string' || !/^https:\/\//.test(sp.videoUrl)) throw new PaymentError('failed-precondition', 'Vidéo manquante.');
+    const throttle = await db.ref('paymentThrottle/' + uid).transaction(
+      (cur) => (typeof cur === 'number' && now() - cur < THROTTLE_MS ? undefined : now())
+    );
+    if (!throttle.committed) throw new PaymentError('resource-exhausted', 'Veuillez patienter quelques secondes avant de réessayer.');
+    if ((await sponsorSlotsTaken(sponsorId)) >= SPONSOR_MAX_ACTIVE) {
+      throw new PaymentError('resource-exhausted', 'Toutes les places de Reels sponsorisés sont prises pour le moment (' + SPONSOR_MAX_ACTIVE + ' en même temps). Réessayez dans quelques jours.');
+    }
+    const txId = newTxId();
+    await db.ref().update({
+      ['sponsoredReels/' + sponsorId + '/paymentTxId']: txId,
+      ['sponsoredReels/' + sponsorId + '/paymentTxAt']: now(),
+      ['payments/' + txId]: {
+        txId, ticket: makeTicket('PAY', now(), random), clientUid: uid, kind: 'sponsor', sponsorId, amount: SPONSOR_PRICE, currency: CURRENCY,
+        provider: providerName, status: 'initiated', createdAt: now(),
+      },
+    });
+    let checkout;
+    try {
+      checkout = await provider.createCheckout({
+        txId, amount: SPONSOR_PRICE, currency: CURRENCY,
+        description: ('Reel sponsorise Je Livre ' + SPONSOR_DAYS + ' jours').slice(0, 100),
+        customer: { uid, phone: sp.ownerPhone || '' },
+        returnUrl: urls.appBaseUrl + '/?payment=return&k=sponsor&tx=' + txId,
+        notifyUrl: urls.webhookUrl,
+      });
+    } catch (e) {
+      await db.ref('payments/' + txId).update({ status: 'failed_to_create', error: String(e && e.message).slice(0, 1000), failedAt: now() });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    if (!checkout || !checkout.paymentUrl) {
+      await db.ref('payments/' + txId).update({ status: 'failed_to_create', error: 'no-payment-url', failedAt: now() });
+      throw new PaymentError('unavailable', 'Le service de paiement est momentanément indisponible. Réessayez dans un instant.');
+    }
+    await db.ref('payments/' + txId).update({ providerRef: checkout.providerRef || null });
+    return { txId, paymentUrl: checkout.paymentUrl, amount: SPONSOR_PRICE };
+  }
+
+  async function createPayment({ uid, orderIds, deliveryRequestId, commissionTopup, payCommission, sponsorId }) {
     if (!uid) throw new PaymentError('unauthenticated', 'Connexion requise.');
     // Le livreur paie sa commission par Mobile Money : le serveur calcule le montant à payer
     // (jamais le client) ; la commission est soldée automatiquement dès que le paiement est confirmé.
@@ -365,6 +426,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     }
     if (commissionTopup != null) return createCommissionTopup({ uid, amount: commissionTopup });
     if (deliveryRequestId != null) return createDeliveryPayment({ uid, deliveryRequestId });
+    if (sponsorId != null) return createSponsorPayment({ uid, sponsorId });
     if (!Array.isArray(orderIds) || orderIds.length < 1 || orderIds.length > MAX_ORDERS_PER_PAYMENT
         || new Set(orderIds).size !== orderIds.length
         || !orderIds.every((id) => typeof id === 'string' && ORDER_ID_RE.test(id))) {
@@ -617,7 +679,24 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
       const updates = {};
       const problems = [];
       const payAtDeliveryOrders = []; // commandes marketplace à clôturer avec leurs effets, après l'update principal
-      if (pay.kind === 'delivery') {
+      if (pay.kind === 'sponsor') {
+        const sp = await readVal('sponsoredReels/' + pay.sponsorId);
+        const held = sp && (sp.paymentTxAt || 0) > now() - SPONSOR_HOLD_MS;
+        if (sp && sp.status === 'awaiting_payment' && sp.ownerUid === pay.clientUid
+            && (held || (await sponsorSlotsTaken(pay.sponsorId)) < SPONSOR_MAX_ACTIVE)) {
+          const b = 'sponsoredReels/' + pay.sponsorId + '/';
+          updates[b + 'status'] = 'active';
+          updates[b + 'paymentStatus'] = 'paid';
+          updates[b + 'paymentTxId'] = txId;
+          updates[b + 'paidAt'] = now();
+          updates[b + 'startsAt'] = now();
+          updates[b + 'endsAt'] = now() + SPONSOR_DAYS * 24 * 3600 * 1000;
+        } else if (sp && sp.status === 'active' && sp.paymentTxId === txId) {
+          // déjà activé par un traitement précédent : rien à refaire
+        } else {
+          problems.push(pay.sponsorId); // place reprise entre-temps, ou Reel supprimé : à rembourser/traiter à la main
+        }
+      } else if (pay.kind === 'delivery') {
         const r = await readVal('deliveryRequests/' + pay.requestId);
         if (r && r.status === 'awaiting_payment' && r.paymentStatus !== 'paid' && r.clientUid === pay.clientUid) {
           updates['deliveryRequests/' + pay.requestId + '/status'] = 'pending';
@@ -703,7 +782,7 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
   return { createPayment, settlePayment, confirmPayment, constants: { CURRENCY, MIN_AMOUNT, THROTTLE_MS, LOCK_MS } };
 }
 
-module.exports = { createPaymentCore, PaymentError };
+module.exports = { createPaymentCore, PaymentError, SPONSOR_PRICE, SPONSOR_DAYS, SPONSOR_MAX_ACTIVE };
 
 });
 
@@ -1230,6 +1309,7 @@ function makeCreatePayment({ getCore, HttpsError }) {
         uid: request.auth && request.auth.uid,
         orderIds: request.data && request.data.orderIds,
         deliveryRequestId: request.data && request.data.deliveryRequestId,
+        sponsorId: request.data && request.data.sponsorId,
         commissionTopup: request.data && request.data.commissionTopup,
         payCommission: request.data && request.data.payCommission === true,
       });

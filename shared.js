@@ -1513,6 +1513,9 @@ function createPayoutCore({ db, provider, now = () => Date.now() }) {
       await walletRef('withdrawnByDay/' + day).transaction((c) => Math.max(0, (c || 0) - amount)).catch(() => {});
       await db.ref('withdrawalRequests/' + id).update({ status: 'failed', refunded: true, lastError: String(e && e.message).slice(0, 500), failedAt: now() }).catch(() => {});
       await ledgerSet('wr_' + id, { type: 'withdrawal_refund', amount, withdrawalId: id }).catch(() => {});
+      if (/exceeds available balance/i.test(String(e && e.message))) {
+        throw new PaymentError('failed-precondition', "Retrait momentanément impossible : l'argent de la plateforme est encore en cours de libération chez le prestataire de paiement. Votre solde n'a pas été débité. Réessayez plus tard.");
+      }
       throw new PaymentError('unavailable', "Le virement n'a pas pu être effectué. Votre solde n'a pas été débité. Réessayez dans un instant.");
     }
     await db.ref('withdrawalRequests/' + id).update({ status: 'processing', payoutId: payout.payoutId, fees: payout.fees, netAmount: payout.netAmount, processedAt: now() });

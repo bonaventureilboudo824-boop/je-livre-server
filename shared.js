@@ -180,7 +180,7 @@ function getPaymentCore() {
   };
   const allowedUids = () => (process.env.MOCK_TEST_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean);
   const provider = getProvider(providerName, { db, urls, allowedUids, token: process.env.HORUSPAY_SECRET_KEY });
-  return { core: createPaymentCore({ db, provider, providerName, urls, notify: makeClientNotify(admin) }), provider, providerName };
+  return { core: createPaymentCore({ db, provider, providerName, urls, notify: makeClientNotify(admin), catalogue: __require('catalogue').getCatalogue() }), provider, providerName };
 }
 
 function getPayoutCore() {
@@ -307,7 +307,7 @@ const SPONSOR_MAX_ACTIVE = 200;
 const SPONSOR_HOLD_MS = 30 * 60 * 1000; // une place réservée au moment du paiement est gardée 30 min
 const { makeTicket, TICKET_RE } = require('tickets');
 
-function createPaymentCore({ db, provider, providerName, urls, notify = null, now = () => Date.now(), random = Math.random }) {
+function createPaymentCore({ db, provider, providerName, urls, notify = null, catalogue = null, now = () => Date.now(), random = Math.random }) {
   const referral = createReferralCore({ db, now, notify });
   const commission = createCommissionCore({ db, now, random });
   const readVal = async (path) => (await db.ref(path).once('value')).val();
@@ -472,7 +472,13 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
       const productsById = {};
       for (const it of Array.isArray(order.items) ? order.items : []) {
         const pid = it && it.pid;
-        if (pid && !(pid in productCache)) productCache[pid] = await readVal('products/' + pid);
+        if (pid && !(pid in productCache)) {
+          // Catalogue dans Supabase : en cas de panne on REFUSE (jamais de prix périmé pour un paiement).
+          if (catalogue && catalogue.active) {
+            try { productCache[pid] = await catalogue.getProduct(pid); }
+            catch (e) { console.error('[catalogue] lecture produit impossible', e); throw new PaymentError('unavailable', 'Le catalogue est momentanément indisponible. Réessayez dans un instant.'); }
+          } else productCache[pid] = await readVal('products/' + pid);
+        }
         if (pid) productsById[pid] = productCache[pid];
       }
       const a = computeOrderAmounts({ order, shop: shopCache[order.shopId], productsById });
@@ -618,6 +624,11 @@ function createPaymentCore({ db, provider, providerName, urls, notify = null, no
     for (const it of o.items || []) {
       if (!it.pid) continue;
       const qty = it.qty || 1;
+      if (catalogue && catalogue.active) {
+        // Simple statistique : une panne ici ne doit jamais bloquer le règlement.
+        try { await catalogue.addPurchase(it.pid, qty); } catch (e) { console.error('[catalogue] compteur d\'achats non mis à jour', e); }
+        continue;
+      }
       await db.ref('productStats/' + it.pid).transaction((cur) => {
         cur = cur || {};
         return { ...cur, purchaseCount: (cur.purchaseCount || 0) + qty };
@@ -2531,7 +2542,7 @@ const MARK = 'compte-supprime';
 const PROFILE_NODES = ['users', 'shops', 'drivers', 'enterprises'];
 const money = (v) => (typeof v === 'number' && isFinite(v) ? v : 0);
 
-function createAccountCore({ db, auth, now }) {
+function createAccountCore({ db, auth, now, catalogue = null }) {
   now = now || (() => Date.now());
   const val = async (path) => (await db.ref(path).once('value')).val();
   const byChild = async (path, field, v) => (await db.ref(path).orderByChild(field).equalTo(v).once('value')).val() || {};
@@ -2633,6 +2644,17 @@ function createAccountCore({ db, auth, now }) {
 
     if (Object.keys(upd).length) await db.ref().update(upd);
 
+    // 5b) contenus publiés dans Supabase (produits, Reels, commentaires, j'aime...). Idempotent : on peut réessayer.
+    if (catalogue && catalogue.active) {
+      try {
+        const c = await catalogue.purgeUser(uid);
+        if (c) { removed.produits += c.produits || 0; removed.reels += c.reels || 0; removed.commentaires += c.commentaires || 0; }
+      } catch (e) {
+        console.error('[suppression de compte] Supabase', e);
+        throw new AccountError('internal', 'Une partie de vos données n\'a pas pu être supprimée. Réessayez dans un instant.');
+      }
+    }
+
     // 6) le compte de connexion, en dernier
     try { await auth.deleteUser(uid); }
     catch (e) { if (!(e && e.code === 'auth/user-not-found')) throw new AccountError('internal', 'Vos données sont supprimées mais la fermeture du compte a échoué. Réessayez dans un instant.'); }
@@ -2654,7 +2676,7 @@ const { createAccountCore, AccountError } = require('accountCore');
 
 function getAccountCore() {
   const admin = getAdmin();
-  return { core: createAccountCore({ db: admin.database(), auth: admin.auth() }) };
+  return { core: createAccountCore({ db: admin.database(), auth: admin.auth(), catalogue: __require('catalogue').getCatalogue() }) };
 }
 
 function makeDeleteAccount({ getCore, HttpsError }) {
@@ -3071,6 +3093,78 @@ module.exports = { createHandoverCore, HandoverError, getHandoverCore, makeGetHa
 });
 
 
+// ---------- catalogue.js : lecture/écriture du catalogue dans Supabase (côté serveur) ----------
+__define('catalogue', function (module, exports, require) {
+'use strict';
+// Le serveur se connecte à Supabase comme un administrateur technique : il signe lui-même un jeton Firebase
+// (uid réservé, présent dans la table admins de Supabase) — aucune clé secrète supplémentaire.
+const SUPABASE_URL = 'https://dtporejrpnndhffbiiim.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_4GFi5c-Mu4nqmesgTgXVwQ_xLtl8DQo';
+const FIREBASE_API_KEY = 'AIzaSyCHFPQQYQ8FcF011AkaHGunISYxiWm7iFY';
+const SERVICE_UID = 'svc-je-livre-server';
+const ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+class CatalogueError extends Error { constructor(code, message) { super(message); this.code = code; } }
+
+function createCatalogueCore({ auth, fetchFn, now, active }) {
+  fetchFn = fetchFn || ((...a) => fetch(...a));
+  now = now || (() => Date.now());
+  let tok = null, tokAt = 0;
+
+  async function token() {
+    if (tok && now() - tokAt < 45 * 60 * 1000) return tok;
+    let custom;
+    try { custom = await auth.createCustomToken(SERVICE_UID, { role: 'authenticated' }); }
+    catch (e) { throw new CatalogueError('unavailable', 'Jeton serveur impossible à créer.'); }
+    const r = await fetchFn('https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=' + FIREBASE_API_KEY, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: custom, returnSecureToken: true }),
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok || !b.idToken) throw new CatalogueError('unavailable', 'Connexion serveur à Supabase refusée.');
+    tok = b.idToken; tokAt = now();
+    return tok;
+  }
+
+  async function call(method, path, body) {
+    const t = await token();
+    const r = await fetchFn(SUPABASE_URL + '/rest/v1/' + path, {
+      method, headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const txt = await r.text();
+    if (!r.ok) { tok = null; throw new CatalogueError('unavailable', 'Supabase a répondu ' + r.status + ' : ' + txt.slice(0, 150)); }
+    return txt ? JSON.parse(txt) : null;
+  }
+
+  // Même forme que l'ancien nœud Firebase products/<id>
+  async function getProduct(id) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) return null;
+    const rows = await call('GET', 'products?select=id,shop_id,data,created_at&id=eq.' + encodeURIComponent(id));
+    const row = Array.isArray(rows) ? rows[0] : null;
+    return row ? Object.assign({}, row.data, { shopId: row.shop_id, createdAt: row.created_at }) : null;
+  }
+  async function addPurchase(key, qty) {
+    if (typeof key !== 'string' || !ID_RE.test(key)) return;
+    await call('POST', 'rpc/jl_product_purchase', { p_key: key, p_qty: Math.max(1, Math.min(1000, Math.round(qty) || 1)) });
+  }
+  async function purgeUser(uid) {
+    if (typeof uid !== 'string' || !uid) throw new CatalogueError('invalid-argument', 'uid manquant');
+    return call('POST', 'rpc/jl_purge_user', { p_uid: uid });
+  }
+  return { active: !!active, getProduct, addPurchase, purgeUser };
+}
+
+// Tant que l'appli écrit encore dans Firebase, la source reste Firebase (valeur par défaut).
+function isActive() { return process.env.CATALOGUE_SOURCE === 'supabase'; }
+function getCatalogue() {
+  const admin = __require('firebaseAdmin').getAdmin();
+  return createCatalogueCore({ auth: admin.auth(), active: isActive() });
+}
+
+module.exports = { createCatalogueCore, CatalogueError, getCatalogue, isActive };
+
+});
+
+
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
@@ -3123,6 +3217,8 @@ module.exports = {
   getSupabaseRoleCore: __require('supabaseRole').getSupabaseRoleCore,
   makeSupabaseRole: __require('supabaseRole').makeSupabaseRole,
   createSupabaseRoleCore: __require('supabaseRole').createSupabaseRoleCore,
+  createCatalogueCore: __require('catalogue').createCatalogueCore,
+  createAccountCore: __require('accountCore').createAccountCore,
   getHandoverCore: handoverHandlers.getHandoverCore,
   makeGetHandoverCodes: handoverHandlers.makeGetHandoverCodes,
   makeConfirmHandover: handoverHandlers.makeConfirmHandover,
@@ -3130,3 +3226,4 @@ module.exports = {
   createHandoverCore: handoverHandlers.createHandoverCore,
   makeTicket: __require('tickets').makeTicket, TICKET_RE: __require('tickets').TICKET_RE,
 };
+

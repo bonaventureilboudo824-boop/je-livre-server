@@ -3175,7 +3175,7 @@ const NODES = ['users','drivers','driverPublic','registrations','referralCodes',
   'deliveryRequests','marketplaceOrders','deliveryCodes','locationRequests','reports','supportTickets','tickets','notifications','remittances',
   'payments','paymentThrottle','withdrawalRequests','withdrawThrottle','commissionPayments','commissionLedger','driverWallets','referrals','referralCredits','platformStats','sponsoredReels','sponsorStats'];
 class ArchiveError extends Error { constructor(code, message) { super(message); this.code = code; } }
-function createArchiveCore({ db, catalogue }) {
+function createArchiveCore({ db, catalogue, auth }) {
   async function run(uid) {
     if (!uid) throw new ArchiveError('unauthenticated', 'Connexion requise.');
     const adm = await db.ref('adminUsers/' + uid).get();
@@ -3189,6 +3189,23 @@ function createArchiveCore({ db, catalogue }) {
       for (let i = 0; i < rows.length; i += 200) await catalogue.upsert('fb_archive', rows.slice(i, i + 200), 'node,key');
       counts[node] = rows.length;
     }
+    if (auth) {
+      const rows = []; let token;
+      do {
+        const page = await auth.listUsers(1000, token);
+        for (const u of page.users) rows.push({
+          uid: u.uid, email: u.email || null, phone: u.phoneNumber || null, display_name: u.displayName || null,
+          password_hash: u.passwordHash || null, password_salt: u.passwordSalt || null,
+          disabled: !!u.disabled, email_verified: !!u.emailVerified,
+          created_ms: u.metadata && u.metadata.creationTime ? Date.parse(u.metadata.creationTime) : null,
+          last_login_ms: u.metadata && u.metadata.lastSignInTime ? Date.parse(u.metadata.lastSignInTime) : null,
+          claims: u.customClaims || {}, providers: (u.providerData || []).map((x) => x.providerId),
+        });
+        token = page.pageToken;
+      } while (token);
+      for (let i = 0; i < rows.length; i += 100) await catalogue.upsert('fb_auth_export', rows.slice(i, i + 100), 'uid');
+      counts.__comptesAuth = rows.length;
+    }
     return { ok: true, counts };
   }
   return { run };
@@ -3196,7 +3213,7 @@ function createArchiveCore({ db, catalogue }) {
 function getArchiveCore() {
   const admin = __require('firebaseAdmin').getAdmin();
   const catalogue = __require('catalogue').getCatalogue();
-  return { core: createArchiveCore({ db: admin.database(), catalogue }) };
+  return { core: createArchiveCore({ db: admin.database(), catalogue, auth: admin.auth() }) };
 }
 function makeArchive({ getCore, HttpsError }) {
   return async (request) => {

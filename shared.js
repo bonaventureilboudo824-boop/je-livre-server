@@ -3153,8 +3153,8 @@ function createCatalogueCore({ auth, fetchFn, now, active }) {
   return { active: !!active, getProduct, addPurchase, purgeUser };
 }
 
-// Tant que l'appli écrit encore dans Firebase, la source reste Firebase (valeur par défaut).
-function isActive() { return process.env.CATALOGUE_SOURCE === 'supabase'; }
+// Le catalogue vit dans Supabase. CATALOGUE_SOURCE=firebase permet un retour en arrière d'urgence (ancien catalogue Firebase).
+function isActive() { return process.env.CATALOGUE_SOURCE !== 'firebase'; }
 function getCatalogue() {
   const admin = __require('firebaseAdmin').getAdmin();
   return createCatalogueCore({ auth: admin.auth(), active: isActive() });

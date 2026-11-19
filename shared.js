@@ -3124,10 +3124,10 @@ function createCatalogueCore({ auth, fetchFn, now, active }) {
     return tok;
   }
 
-  async function call(method, path, body) {
+  async function call(method, path, body, extra) {
     const t = await token();
     const r = await fetchFn(SUPABASE_URL + '/rest/v1/' + path, {
-      method, headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' },
+      method, headers: Object.assign({ apikey: SUPABASE_KEY, Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, extra || {}),
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const txt = await r.text();
@@ -3150,7 +3150,10 @@ function createCatalogueCore({ auth, fetchFn, now, active }) {
     if (typeof uid !== 'string' || !uid) throw new CatalogueError('invalid-argument', 'uid manquant');
     return call('POST', 'rpc/jl_purge_user', { p_uid: uid });
   }
-  return { active: !!active, getProduct, addPurchase, purgeUser };
+  async function upsert(table, rows, conflict) {
+    return call('POST', table + '?on_conflict=' + conflict, rows, { Prefer: 'resolution=merge-duplicates,return=minimal' });
+  }
+  return { active: !!active, getProduct, addPurchase, purgeUser, upsert };
 }
 
 // Le catalogue vit dans Supabase. CATALOGUE_SOURCE=firebase permet un retour en arrière d'urgence (ancien catalogue Firebase).
@@ -3164,6 +3167,50 @@ module.exports = { createCatalogueCore, CatalogueError, getCatalogue, isActive }
 
 });
 
+
+// ---------- archive.js : copie ponctuelle Firebase -> Supabase (réservée à l'admin, supprimée à la fin de la migration) ----------
+__define('archive', function (module, exports, require) {
+'use strict';
+const NODES = ['users','drivers','driverPublic','registrations','referralCodes','enterprises','adminUsers','driverPayoutAccounts','presence','userAffinity','blocks','bans','termsAcceptances',
+  'deliveryRequests','marketplaceOrders','deliveryCodes','locationRequests','reports','supportTickets','tickets','notifications','remittances',
+  'payments','paymentThrottle','withdrawalRequests','withdrawThrottle','commissionPayments','commissionLedger','driverWallets','referrals','referralCredits','platformStats','sponsoredReels','sponsorStats'];
+class ArchiveError extends Error { constructor(code, message) { super(message); this.code = code; } }
+function createArchiveCore({ db, catalogue }) {
+  async function run(uid) {
+    if (!uid) throw new ArchiveError('unauthenticated', 'Connexion requise.');
+    const adm = await db.ref('adminUsers/' + uid).get();
+    if (!adm.exists()) throw new ArchiveError('permission-denied', 'Réservé aux administrateurs.');
+    const counts = {};
+    for (const node of NODES) {
+      const snap = await db.ref(node).get();
+      const v = snap.val();
+      const rows = [];
+      if (v && typeof v === 'object') for (const k of Object.keys(v)) rows.push({ node, key: k, value: v[k] });
+      for (let i = 0; i < rows.length; i += 200) await catalogue.upsert('fb_archive', rows.slice(i, i + 200), 'node,key');
+      counts[node] = rows.length;
+    }
+    return { ok: true, counts };
+  }
+  return { run };
+}
+function getArchiveCore() {
+  const admin = __require('firebaseAdmin').getAdmin();
+  const catalogue = __require('catalogue').getCatalogue();
+  return { core: createArchiveCore({ db: admin.database(), catalogue }) };
+}
+function makeArchive({ getCore, HttpsError }) {
+  return async (request) => {
+    try { const { core } = getCore(); return await core.run(request.auth && request.auth.uid); }
+    catch (e) {
+      if (e instanceof ArchiveError) throw new HttpsError(e.code, e.message);
+      console.error('[archive] erreur', e);
+      throw new HttpsError('internal', 'Erreur interne : ' + String(e && e.message || e).slice(0, 200));
+    }
+  };
+}
+module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive, NODES };
+
+});
 
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
@@ -3214,6 +3261,9 @@ module.exports = {
   getLinkCore: linkHandlers.getLinkCore,
   makeLinkClientAccount: linkHandlers.makeLinkClientAccount,
   createLinkCore: linkHandlers.createLinkCore,
+  getArchiveCore: __require('archive').getArchiveCore,
+  makeArchive: __require('archive').makeArchive,
+  createArchiveCore: __require('archive').createArchiveCore,
   getSupabaseRoleCore: __require('supabaseRole').getSupabaseRoleCore,
   makeSupabaseRole: __require('supabaseRole').makeSupabaseRole,
   createSupabaseRoleCore: __require('supabaseRole').createSupabaseRoleCore,

@@ -2129,7 +2129,12 @@ function getOtpCore() {
       const u = await admin.auth().getUser(uid);
       return !!(u.customClaims && u.customClaims.phoneVerified);
     },
-    setVerifiedClaim: async (uid) => { await admin.auth().setCustomUserClaims(uid, { phoneVerified: true }); },
+    setVerifiedClaim: async (uid) => {
+      // On FUSIONNE avec les claims existants (ne rien écraser) et on ajoute role:'authenticated' (exigé par Supabase).
+      const a = admin.auth();
+      const u = await a.getUser(uid).catch(() => null);
+      await a.setCustomUserClaims(uid, { ...((u && u.customClaims) || {}), phoneVerified: true, role: 'authenticated' });
+    },
     setPassword: async (uid, newPassword) => { await admin.auth().updateUser(uid, { password: newPassword }); },
   });
   return { core };
@@ -2882,6 +2887,50 @@ module.exports = { createLinkCore, LinkError, getLinkCore, makeLinkClientAccount
 
 });
 
+
+// ---------- supabaseRole.js : autorise un compte Firebase à parler à Supabase ----------
+__define('supabaseRole', function (module, exports, require) {
+'use strict';
+// Supabase accepte les jetons Firebase (Third-Party Auth) à condition qu'ils portent le claim role = 'authenticated'.
+// Ce module l'ajoute au compte SANS effacer les autres claims (phoneVerified...).
+class SbError extends Error { constructor(code, message) { super(message); this.code = code; } }
+
+function createSupabaseRoleCore({ auth }) {
+  async function ensureRole({ uid }) {
+    if (!uid) throw new SbError('unauthenticated', 'Connexion requise.');
+    let user;
+    try { user = await auth.getUser(uid); } catch (e) { throw new SbError('not-found', 'Compte introuvable.'); }
+    if (user.disabled) throw new SbError('permission-denied', 'Compte désactivé.');
+    const claims = user.customClaims || {};
+    if (claims.role === 'authenticated') return { ok: true, changed: false };
+    await auth.setCustomUserClaims(uid, { ...claims, role: 'authenticated' });
+    return { ok: true, changed: true };
+  }
+  return { ensureRole };
+}
+
+function getSupabaseRoleCore() {
+  const admin = __require('firebaseAdmin').getAdmin();
+  return { core: createSupabaseRoleCore({ auth: admin.auth() }) };
+}
+
+function makeSupabaseRole({ getCore, HttpsError }) {
+  return async (request) => {
+    try {
+      const { core } = getCore();
+      return await core.ensureRole({ uid: request.auth && request.auth.uid });
+    } catch (e) {
+      if (e instanceof SbError) throw new HttpsError(e.code, e.message);
+      console.error('[supabaseRole] erreur inattendue', e);
+      throw new HttpsError('internal', 'Erreur interne. Réessayez dans un instant.');
+    }
+  };
+}
+
+module.exports = { createSupabaseRoleCore, SbError, getSupabaseRoleCore, makeSupabaseRole };
+
+});
+
 // ---------- handover.js : codes de remise (récupération / livraison) ----------
 __define('handoverHandlers', function (module, exports, require) {
 'use strict';
@@ -3071,6 +3120,9 @@ module.exports = {
   getLinkCore: linkHandlers.getLinkCore,
   makeLinkClientAccount: linkHandlers.makeLinkClientAccount,
   createLinkCore: linkHandlers.createLinkCore,
+  getSupabaseRoleCore: __require('supabaseRole').getSupabaseRoleCore,
+  makeSupabaseRole: __require('supabaseRole').makeSupabaseRole,
+  createSupabaseRoleCore: __require('supabaseRole').createSupabaseRoleCore,
   getHandoverCore: handoverHandlers.getHandoverCore,
   makeGetHandoverCodes: handoverHandlers.makeGetHandoverCodes,
   makeConfirmHandover: handoverHandlers.makeConfirmHandover,

@@ -24,6 +24,7 @@ const routes = {
   handoverCodes: s.wrapCallable(s.makeGetHandoverCodes, s.getHandoverCore),
   confirmHandover: s.wrapCallable(s.makeConfirmHandover, s.getHandoverCore),
   linkClientAccount: s.wrapCallable(s.makeLinkClientAccount, s.getLinkCore),
+  supabaseRole: s.wrapCallable(s.makeSupabaseRole, s.getSupabaseRoleCore),
 };
 
 module.exports = (req, res) => {

@@ -3236,6 +3236,7 @@ __define('rtdb', function (module, exports, require) {
 'use strict';
 const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity' };
 const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
+const SPECIAL = ['referralCodes'];   // nœuds routés vers Supabase mais stockés dans une table à part (code -> uid)
 
 function pushId(now) {
   const chars = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
@@ -3339,18 +3340,33 @@ function createSupabaseDb({ call, now }) {
     return ref;
   }
 
+  function codeRef(code) {
+    const e = encodeURIComponent(code);
+    return {
+      key: code,
+      async get() { return this.once(); },
+      async once() { const rows = await call('GET', 'referral_codes?select=uid&code=eq.' + e); return new Snap(code, Array.isArray(rows) && rows[0] ? rows[0].uid : null); },
+      async set(uid) {
+        if (uid === null || uid === undefined) { await call('DELETE', 'referral_codes?code=eq.' + e); return; }
+        await call('POST', 'referral_codes?on_conflict=code', { code, uid: String(uid) }, { Prefer: 'resolution=merge-duplicates,return=minimal' });
+      },
+      async remove() { return this.set(null); },
+    };
+  }
   return { ref(path) {
     const segs = String(path || '').split('/').filter(Boolean);
+    for (const s of segs) if (!SEG_RE.test(s)) throw new Error('chemin invalide');
+    if (segs[0] === 'referralCodes') { if (segs.length !== 2) throw new Error('referralCodes : un code à la fois'); return codeRef(segs[1]); }
     const table = ROUTES[segs[0]];
     if (!table) throw new Error('nœud non migré : ' + segs[0]);
-    for (const s of segs) if (!SEG_RE.test(s)) throw new Error('chemin invalide');
     return makeRef(table, segs.slice(1));
   } };
 }
 
 // Aiguillage : nœuds migrés -> Supabase, les autres -> Firebase.
 function createHybridDb({ firebaseDb, sbDb, active }) {
-  const routed = (p) => active && Object.prototype.hasOwnProperty.call(ROUTES, String(p).split('/').filter(Boolean)[0]);
+  const isRouted = (n) => Object.prototype.hasOwnProperty.call(ROUTES, n) || SPECIAL.indexOf(n) >= 0;
+  const routed = (p) => active && isRouted(String(p).split('/').filter(Boolean)[0]);
   return { ref(path) {
     const first = String(path || '').split('/').filter(Boolean)[0];
     if (!first) {
@@ -3363,7 +3379,7 @@ function createHybridDb({ firebaseDb, sbDb, active }) {
         for (const k of sbk) await sbDb.ref(k).set(upd[k]);
       } };
     }
-    if (active && Object.prototype.hasOwnProperty.call(ROUTES, first)) return sbDb.ref(path);
+    if (active && isRouted(first)) return sbDb.ref(path);
     return firebaseDb.ref(path);
   } };
 }

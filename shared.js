@@ -3234,7 +3234,7 @@ module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive,
 // tous les autres restent sur Firebase tant que leur migration n'est pas faite (RTDB_SOURCE=firebase = retour arrière).
 __define('rtdb', function (module, exports, require) {
 'use strict';
-const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity' };
+const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity', deliveryRequests: 'delivery_requests', marketplaceOrders: 'marketplace_orders', deliveryCodes: 'delivery_codes', locationRequests: 'location_requests', notifications: 'notifications' };
 const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
 const SPECIAL = ['referralCodes'];   // nœuds routés vers Supabase mais stockés dans une table à part (code -> uid)
 
@@ -3295,6 +3295,7 @@ function createSupabaseDb({ call, now }) {
             keys.sort((a, b) => { const x = getAt(obj[a], filt.child.split('/')), y = getAt(obj[b], filt.child.split('/')); return x < y ? -1 : x > y ? 1 : 0; });
             if (filt.last) keys = keys.slice(-filt.last);
           }
+          if (filt && !filt.child && filt.last) { keys.sort(); keys = keys.slice(-filt.last); }
           const out = {}; keys.forEach((k) => { out[k] = obj[k]; });
           return new Snap(this.key, keys.length ? out : null);
         }
@@ -3326,7 +3327,7 @@ function createSupabaseDb({ call, now }) {
           const data = await loadRecord(table, id);
           const cur = data === null ? null : getAt(data, sub);
           let nv;
-          try { nv = fn(cur); } catch (e) { throw e; }
+          try { nv = fn(cur === null ? null : JSON.parse(JSON.stringify(cur))); } catch (e) { throw e; }
           if (nv === undefined) return { committed: false, snapshot: new Snap(this.key, cur) };
           const cv = clean(nv);
           if (await write(table, id, sub, cv, 'set', cur, true)) return { committed: true, snapshot: new Snap(this.key, cv) };

@@ -156,7 +156,7 @@ function serverBaseUrl() {
 
 // Envoie une notification à un CLIENT (jeton rangé dans users/<uid>/fcmToken).
 function makeClientNotify(admin) {
-  const nc = createNotifyCore({ db: admin.database(), messaging: admin.messaging() });
+  const nc = createNotifyCore({ db: __require('rtdb').getDb(admin), messaging: admin.messaging() });
   return ({ uid, title, body, data }) => nc.sendToOne({ collection: 'users', uid, title, body, data });
 }
 
@@ -173,7 +173,7 @@ function safeAppBaseUrl(v) {
 function getPaymentCore() {
   const admin = getAdmin();
   const providerName = process.env.PAYMENT_PROVIDER || 'mock';
-  const db = admin.database();
+  const db = __require('rtdb').getDb(admin);
   const urls = {
     appBaseUrl: safeAppBaseUrl(process.env.APP_BASE_URL),
     webhookUrl: process.env.WEBHOOK_URL || (serverBaseUrl() + '/api/paymentWebhook'),
@@ -188,7 +188,7 @@ function getPayoutCore() {
   // (il n'existe pas de simulation pour l'argent qui sort) — indépendant du
   // réglage PAYMENT_PROVIDER, qui ne concerne que l'encaissement.
   const admin = getAdmin();
-  const db = admin.database();
+  const db = __require('rtdb').getDb(admin);
   const createHorusPayProvider = __require('paymentProviderHoruspay');
   const provider = createHorusPayProvider({ token: process.env.HORUSPAY_SECRET_KEY });
   return { core: createPayoutCore({ db, provider }) };
@@ -196,18 +196,18 @@ function getPayoutCore() {
 
 function getNotifyCore() {
   const admin = getAdmin();
-  const db = admin.database();
+  const db = __require('rtdb').getDb(admin);
   return { core: createNotifyCore({ db, messaging: admin.messaging() }) };
 }
 
 function getReferralCore() {
   const admin = getAdmin();
-  return { core: createReferralCore({ db: admin.database(), notify: makeClientNotify(admin) }) };
+  return { core: createReferralCore({ db: __require('rtdb').getDb(admin), notify: makeClientNotify(admin) }) };
 }
 
 function getCommissionCore() {
   const admin = getAdmin();
-  return { core: createCommissionCore({ db: admin.database() }) };
+  return { core: createCommissionCore({ db: __require('rtdb').getDb(admin) }) };
 }
 
 module.exports = { getPaymentCore, getPayoutCore, getNotifyCore, getReferralCore, getCommissionCore, serverBaseUrl };
@@ -2123,7 +2123,7 @@ function syntheticEmail(phoneKey, role) {
 function getOtpCore() {
   const admin = getAdmin();
   const providerName = process.env.SMS_PROVIDER || 'mock';
-  const db = admin.database();
+  const db = __require('rtdb').getDb(admin);
   const provider = getSmsProvider(providerName, {
     db,
     token: process.env.BBG_SMS_TOKEN,
@@ -2676,7 +2676,7 @@ const { createAccountCore, AccountError } = require('accountCore');
 
 function getAccountCore() {
   const admin = getAdmin();
-  return { core: createAccountCore({ db: admin.database(), auth: admin.auth(), catalogue: __require('catalogue').getCatalogue() }) };
+  return { core: createAccountCore({ db: __require('rtdb').getDb(admin), auth: admin.auth(), catalogue: __require('catalogue').getCatalogue() }) };
 }
 
 function makeDeleteAccount({ getCore, HttpsError }) {
@@ -2802,7 +2802,7 @@ const { createStatsCore, StatsError } = require('statsCore');
 
 function getStatsCore() {
   const admin = getAdmin();
-  return { core: createStatsCore({ db: admin.database(), auth: admin.auth() }) };
+  return { core: createStatsCore({ db: __require('rtdb').getDb(admin), auth: admin.auth() }) };
 }
 
 // Le cache de 15 s vit dans le cœur : on garde donc UNE instance par processus.
@@ -2889,7 +2889,7 @@ function createLinkCore({ db, auth, now, randomInt }) {
 
 function getLinkCore() {
   const admin = getAdmin();
-  return { core: createLinkCore({ db: admin.database(), auth: admin.auth() }) };
+  return { core: createLinkCore({ db: __require('rtdb').getDb(admin), auth: admin.auth() }) };
 }
 
 function makeLinkClientAccount({ getCore, HttpsError }) {
@@ -3071,8 +3071,8 @@ function createHandoverCore({ db, now, randomInt, notify }) {
 
 function getHandoverCore() {
   const admin = getAdmin();
-  const nc = __require('notifyCore').createNotifyCore({ db: admin.database(), messaging: admin.messaging() });
-  return { core: createHandoverCore({ db: admin.database(), notify: (m) => nc.sendToOne(m) }) };
+  const nc = __require('notifyCore').createNotifyCore({ db: __require('rtdb').getDb(admin), messaging: admin.messaging() });
+  return { core: createHandoverCore({ db: __require('rtdb').getDb(admin), notify: (m) => nc.sendToOne(m) }) };
 }
 
 const wrap = (fn) => ({ getCore, HttpsError }) => async (request) => {
@@ -3153,7 +3153,7 @@ function createCatalogueCore({ auth, fetchFn, now, active }) {
   async function upsert(table, rows, conflict) {
     return call('POST', table + '?on_conflict=' + conflict, rows, { Prefer: 'resolution=merge-duplicates,return=minimal' });
   }
-  return { active: !!active, getProduct, addPurchase, purgeUser, upsert };
+  return { active: !!active, getProduct, addPurchase, purgeUser, upsert, call };
 }
 
 // Le catalogue vit dans Supabase. CATALOGUE_SOURCE=firebase permet un retour en arrière d'urgence (ancien catalogue Firebase).
@@ -3229,6 +3229,146 @@ module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive,
 
 });
 
+// ---------- rtdb.js : base de données « à la Firebase » (ref/get/set/update/transaction) branchée sur Supabase ----------
+// Le serveur garde son code actuel : seuls les nœuds listés dans ROUTES sont lus/écrits dans Supabase,
+// tous les autres restent sur Firebase tant que leur migration n'est pas faite (RTDB_SOURCE=firebase = retour arrière).
+__define('rtdb', function (module, exports, require) {
+'use strict';
+const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations' };
+const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
+
+function pushId(now) {
+  const chars = '-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz';
+  let t = now(), id = '';
+  for (let i = 0; i < 8; i++) { id = chars.charAt(t % 64) + id; t = Math.floor(t / 64); }
+  for (let i = 0; i < 12; i++) id += chars.charAt(Math.floor(Math.random() * 64));
+  return id;
+}
+const clean = (v) => {            // Firebase ne stocke ni null, ni undefined, ni objet vide
+  if (v === undefined || v === null) return null;
+  if (typeof v === 'object') {
+    const o = Array.isArray(v) ? [] : {};
+    let n = 0;
+    for (const k of Object.keys(v)) { const c = clean(v[k]); if (c !== null) { o[k] = c; n++; } }
+    return n ? o : null;
+  }
+  return v;
+};
+const getAt = (obj, path) => { let c = obj; for (const k of path) { if (c && typeof c === 'object' && k in c) c = c[k]; else return null; } return c === undefined ? null : c; };
+const same = (a, b) => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+
+class Snap {
+  constructor(key, val) { this.key = key; this._v = val === undefined ? null : val; }
+  val() { return this._v; }
+  exists() { return this._v !== null; }
+  child(k) { return new Snap(k, getAt(this._v, String(k).split('/').filter(Boolean))); }
+  forEach(cb) { if (this._v && typeof this._v === 'object') for (const k of Object.keys(this._v)) { if (cb(new Snap(k, this._v[k])) === true) return true; } return false; }
+  numChildren() { return this._v && typeof this._v === 'object' ? Object.keys(this._v).length : 0; }
+}
+
+function createSupabaseDb({ call, now }) {
+  now = now || (() => Date.now());
+
+  async function loadRecord(table, id) {
+    const rows = await call('GET', table + '?select=data&id=eq.' + encodeURIComponent(id));
+    return Array.isArray(rows) && rows[0] ? rows[0].data : null;
+  }
+  async function write(table, id, path, value, mode, expect, check) {
+    const ok = await call('POST', 'rpc/jl_rec_write', { p_table: table, p_id: id, p_path: path, p_value: value === undefined ? null : value, p_mode: mode, p_expect: expect === undefined ? null : expect, p_check: !!check });
+    return ok === true;
+  }
+
+  function makeRef(table, segs, filt) {
+    const id = segs[0], sub = segs.slice(1);
+    const ref = {
+      key: segs.length ? segs[segs.length - 1] : table,
+      child(k) { return makeRef(table, segs.concat(String(k).split('/').filter(Boolean))); },
+      async get() { return this.once('value'); },
+      async once() {
+        if (!segs.length) {   // tout le nœud
+          const rows = await call('GET', table + '?select=id,data');
+          let obj = {}; for (const r of rows || []) obj[r.id] = r.data;
+          let keys = Object.keys(obj);
+          if (filt && filt.child) {
+            if (filt.equal !== undefined) keys = keys.filter((k) => same(getAt(obj[k], filt.child.split('/')), filt.equal));
+            keys.sort((a, b) => { const x = getAt(obj[a], filt.child.split('/')), y = getAt(obj[b], filt.child.split('/')); return x < y ? -1 : x > y ? 1 : 0; });
+            if (filt.last) keys = keys.slice(-filt.last);
+          }
+          const out = {}; keys.forEach((k) => { out[k] = obj[k]; });
+          return new Snap(this.key, keys.length ? out : null);
+        }
+        const data = await loadRecord(table, id);
+        return new Snap(this.key, data === null ? null : getAt(data, sub));
+      },
+      async set(v) {
+        if (!segs.length) throw new Error('set sur tout un nœud interdit');
+        const cv = clean(v);
+        if (!sub.length && cv === null) { await call('DELETE', table + '?id=eq.' + encodeURIComponent(id)); return; }
+        await write(table, id, sub, cv, 'set', null, false);
+      },
+      async remove() { return this.set(null); },
+      async update(patch) {
+        if (!segs.length) throw new Error('update sur tout un nœud interdit');
+        const keys = Object.keys(patch || {});
+        const simple = keys.every((k) => !k.includes('/'));
+        if (simple) { await write(table, id, sub, clean(patch) || {}, 'merge', null, false); return; }
+        for (const k of keys) await write(table, id, sub.concat(k.split('/').filter(Boolean)), clean(patch[k]), 'set', null, false);
+      },
+      async push(v) {
+        const key = pushId(now); const r = makeRef(table, segs.concat([key]));
+        if (v !== undefined) await r.set(v);
+        return r;
+      },
+      async transaction(fn) {
+        if (!segs.length) throw new Error('transaction sur tout un nœud interdit');
+        for (let i = 0; i < 8; i++) {
+          const data = await loadRecord(table, id);
+          const cur = data === null ? null : getAt(data, sub);
+          let nv;
+          try { nv = fn(cur); } catch (e) { throw e; }
+          if (nv === undefined) return { committed: false, snapshot: new Snap(this.key, cur) };
+          const cv = clean(nv);
+          if (await write(table, id, sub, cv, 'set', cur, true)) return { committed: true, snapshot: new Snap(this.key, cv) };
+        }
+        throw new Error('transaction : trop de conflits, réessayez');
+      },
+      orderByChild(c) { return makeRef(table, segs, Object.assign({}, filt, { child: c })); },
+      equalTo(v) { return makeRef(table, segs, Object.assign({}, filt, { equal: v })); },
+      limitToLast(n) { return makeRef(table, segs, Object.assign({}, filt, { last: n })); },
+    };
+    return ref;
+  }
+
+  return { ref(path) {
+    const segs = String(path || '').split('/').filter(Boolean);
+    const table = ROUTES[segs[0]];
+    if (!table) throw new Error('nœud non migré : ' + segs[0]);
+    for (const s of segs) if (!SEG_RE.test(s)) throw new Error('chemin invalide');
+    return makeRef(table, segs.slice(1));
+  } };
+}
+
+// Aiguillage : nœuds migrés -> Supabase, les autres -> Firebase.
+function createHybridDb({ firebaseDb, sbDb, active }) {
+  return { ref(path) {
+    const first = String(path || '').split('/').filter(Boolean)[0];
+    if (active && Object.prototype.hasOwnProperty.call(ROUTES, first)) return sbDb.ref(path);
+    return firebaseDb.ref(path);
+  } };
+}
+// Désactivé tant que le site/l'appli n'écrivent pas aussi dans Supabase : RTDB_SOURCE=supabase l'active.
+function isActive() { return process.env.RTDB_SOURCE === 'supabase'; }
+let cached = null, cachedFor = null;
+function getDb(admin) {
+  if (cached && cachedFor === admin) return cached;
+  const cat = __require('catalogue').getCatalogue();
+  cached = createHybridDb({ firebaseDb: admin.database(), sbDb: createSupabaseDb({ call: cat.call }), active: isActive() });
+  cachedFor = admin; return cached;
+}
+module.exports = { createSupabaseDb, createHybridDb, getDb, isActive, ROUTES, Snap };
+
+});
+
 const adapter = __require('adapter');
 const paymentGetCore = __require('paymentGetCore');
 const paymentHandlers = __require('paymentHandlers');
@@ -3284,6 +3424,9 @@ module.exports = {
   getSupabaseRoleCore: __require('supabaseRole').getSupabaseRoleCore,
   makeSupabaseRole: __require('supabaseRole').makeSupabaseRole,
   createSupabaseRoleCore: __require('supabaseRole').createSupabaseRoleCore,
+  createSupabaseDb: __require('rtdb').createSupabaseDb,
+  createHybridDb: __require('rtdb').createHybridDb,
+  getDb: __require('rtdb').getDb,
   createCatalogueCore: __require('catalogue').createCatalogueCore,
   createAccountCore: __require('accountCore').createAccountCore,
   getHandoverCore: handoverHandlers.getHandoverCore,

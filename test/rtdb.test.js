@@ -16,8 +16,15 @@ function fakeCall() {
   };
   const get = (o, p) => { let c = o; for (const k of p) { if (c && typeof c === 'object' && k in c) c = c[k]; else return null; } return c; };
   const log = []; let hook = null;
+  const codes = {};
   async function call(method, path, body) {
     log.push(method + ' ' + path);
+    if (path.startsWith('referral_codes')) {
+      const m = /code=eq\.(.+)$/.exec(path);
+      if (method === 'GET') return codes[decodeURIComponent(m[1])] ? [{ uid: codes[decodeURIComponent(m[1])] }] : [];
+      if (method === 'POST') { codes[body.code] = body.uid; return null; }
+      if (method === 'DELETE') { delete codes[decodeURIComponent(m[1])]; return null; }
+    }
     if (method === 'GET') {
       const [t, q] = path.split('?'); const m = /id=eq\.(.+)$/.exec(q);
       if (m) { const id = decodeURIComponent(m[1]); return tables[t][id] ? [{ data: clone(tables[t][id]) }] : []; }
@@ -108,5 +115,12 @@ function fakeCall() {
   assert.deepStrictEqual(fbCalls, [{ 'payments/t9/status': 'done', 'withdrawalRequests/w1': { a: 1 } }]);
   const m1 = (await db.ref('users/m1').get()).val(); assert.strictEqual(m1.referralBalance, 30); assert.ok(!('name' in m1));
   await hy2.ref().update({ 'users/m1': null }); assert.strictEqual((await db.ref('users/m1').get()).exists(), false);
+  // codes de parrainage
+  await db.ref('referralCodes/AB12').set('u7');
+  assert.strictEqual((await db.ref('referralCodes/AB12').get()).val(), 'u7');
+  assert.strictEqual((await db.ref('referralCodes/ZZ').get()).exists(), false);
+  const fbc = []; const hy3 = createHybridDb({ firebaseDb: { ref: () => ({ update: async (u) => fbc.push(u) }) }, sbDb: db, active: true });
+  await hy3.ref().update({ 'referralCodes/AB12': null, 'payments/p': { a: 1 } });
+  assert.strictEqual((await db.ref('referralCodes/AB12').get()).exists(), false); assert.deepStrictEqual(fbc, [{ 'payments/p': { a: 1 } }]);
   console.log('rtdb.test.js : tout est OK');
 })().catch((e) => { console.error(e); process.exit(1); });

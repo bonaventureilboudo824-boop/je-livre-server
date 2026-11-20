@@ -3234,7 +3234,7 @@ module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive,
 // tous les autres restent sur Firebase tant que leur migration n'est pas faite (RTDB_SOURCE=firebase = retour arrière).
 __define('rtdb', function (module, exports, require) {
 'use strict';
-const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity', deliveryRequests: 'delivery_requests', marketplaceOrders: 'marketplace_orders', deliveryCodes: 'delivery_codes', locationRequests: 'location_requests', notifications: 'notifications' };
+const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity', deliveryRequests: 'delivery_requests', marketplaceOrders: 'marketplace_orders', deliveryCodes: 'delivery_codes', locationRequests: 'location_requests', notifications: 'notifications', supportTickets: 'support_tickets', tickets: 'ticket_registry', reports: 'reports', sponsoredReels: 'sponsored_reels', sponsorStats: 'sponsor_stats' };
 const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
 const SPECIAL = ['referralCodes'];   // nœuds routés vers Supabase mais stockés dans une table à part (code -> uid)
 

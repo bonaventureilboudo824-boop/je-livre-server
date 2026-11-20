@@ -52,6 +52,7 @@ function fakeCall() {
   assert.strictEqual((await db.ref('users/u1/nope/x').once('value')).val(), null);
   // update : champs simples, null supprime, chemins avec /
   await db.ref('users/u1').update({ name: 'B', referralCount: 3, phone: null });
+  assert.ok(!('phone' in (await db.ref('users/u1').get()).val()), 'update(null) supprime le champ');
   await db.ref('users/u1').update({ 'a/b': 1 });
   assert.deepStrictEqual((await db.ref('users/u1').get()).val().a, { b: 1 });
   assert.strictEqual((await db.ref('users/u1/name').get()).val(), 'B');
@@ -99,5 +100,13 @@ function fakeCall() {
   assert.ok(hy.ref('users/u1').child);
   const off = createHybridDb({ firebaseDb: fb, sbDb: db, active: false });
   assert.strictEqual(off.ref('users/u1').from, 'firebase', 'retour arrière RTDB_SOURCE=firebase');
+  // mise à jour multi-chemins à la racine
+  const fbCalls = []; const fb2 = { ref: (p) => ({ update: async (u) => { fbCalls.push(u); } }) };
+  const hy2 = createHybridDb({ firebaseDb: fb2, sbDb: db, active: true });
+  await db.ref('users/m1').set({ name: 'M', referralBalance: 5 });
+  await hy2.ref().update({ 'payments/t9/status': 'done', 'users/m1/referralBalance': 30, 'users/m1/name': null, 'withdrawalRequests/w1': { a: 1 } });
+  assert.deepStrictEqual(fbCalls, [{ 'payments/t9/status': 'done', 'withdrawalRequests/w1': { a: 1 } }]);
+  const m1 = (await db.ref('users/m1').get()).val(); assert.strictEqual(m1.referralBalance, 30); assert.ok(!('name' in m1));
+  await hy2.ref().update({ 'users/m1': null }); assert.strictEqual((await db.ref('users/m1').get()).exists(), false);
   console.log('rtdb.test.js : tout est OK');
 })().catch((e) => { console.error(e); process.exit(1); });

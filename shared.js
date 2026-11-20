@@ -3234,7 +3234,7 @@ module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive,
 // tous les autres restent sur Firebase tant que leur migration n'est pas faite (RTDB_SOURCE=firebase = retour arrière).
 __define('rtdb', function (module, exports, require) {
 'use strict';
-const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations' };
+const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity' };
 const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
 
 function pushId(now) {
@@ -3311,7 +3311,7 @@ function createSupabaseDb({ call, now }) {
         if (!segs.length) throw new Error('update sur tout un nœud interdit');
         const keys = Object.keys(patch || {});
         const simple = keys.every((k) => !k.includes('/'));
-        if (simple) { await write(table, id, sub, clean(patch) || {}, 'merge', null, false); return; }
+        if (simple) { const pv = {}; keys.forEach((k) => { pv[k] = clean(patch[k]); }); await write(table, id, sub, pv, 'merge', null, false); return; }
         for (const k of keys) await write(table, id, sub.concat(k.split('/').filter(Boolean)), clean(patch[k]), 'set', null, false);
       },
       async push(v) {
@@ -3350,14 +3350,25 @@ function createSupabaseDb({ call, now }) {
 
 // Aiguillage : nœuds migrés -> Supabase, les autres -> Firebase.
 function createHybridDb({ firebaseDb, sbDb, active }) {
+  const routed = (p) => active && Object.prototype.hasOwnProperty.call(ROUTES, String(p).split('/').filter(Boolean)[0]);
   return { ref(path) {
     const first = String(path || '').split('/').filter(Boolean)[0];
+    if (!first) {
+      // Mise à jour multi-chemins à la racine : les chemins migrés vont dans Supabase, les autres dans Firebase.
+      // (Pas atomique entre les deux systèmes : disparaît quand tout est dans Supabase.)
+      return { key: null, async update(upd) {
+        const fb = {}, sbk = [];
+        for (const k of Object.keys(upd || {})) { if (routed(k)) sbk.push(k); else fb[k] = upd[k]; }
+        if (Object.keys(fb).length) await firebaseDb.ref().update(fb);
+        for (const k of sbk) await sbDb.ref(k).set(upd[k]);
+      } };
+    }
     if (active && Object.prototype.hasOwnProperty.call(ROUTES, first)) return sbDb.ref(path);
     return firebaseDb.ref(path);
   } };
 }
-// Désactivé tant que le site/l'appli n'écrivent pas aussi dans Supabase : RTDB_SOURCE=supabase l'active.
-function isActive() { return process.env.RTDB_SOURCE === 'supabase'; }
+// Actif par défaut. RTDB_SOURCE=firebase = retour arrière d'urgence (profils relus dans Firebase).
+function isActive() { return process.env.RTDB_SOURCE !== 'firebase'; }
 let cached = null, cachedFor = null;
 function getDb(admin) {
   if (cached && cachedFor === admin) return cached;

@@ -4,7 +4,7 @@ const { createSupabaseDb, createHybridDb } = require('../shared');
 
 // Faux PostgREST : mêmes règles que la fonction SQL jl_rec_write
 function fakeCall() {
-  const tables = { profiles: {}, drivers: {}, driver_public: {}, enterprises: {}, registrations: {} };
+  const tables = { profiles: {}, drivers: {}, driver_public: {}, enterprises: {}, registrations: {}, payments: {}, withdrawal_requests: {}, platform_stats: {}, payment_throttle: {}, driver_wallets: {}, referrals: {} };
   const clone = (x) => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
   const setPath = (d, p, v) => {
     if (!p.length) return v;
@@ -31,6 +31,17 @@ function fakeCall() {
       return Object.keys(tables[t]).map((id) => ({ id, data: clone(tables[t][id]) }));
     }
     if (method === 'DELETE') { const [t, q] = path.split('?'); delete tables[t][decodeURIComponent(/id=eq\.(.+)$/.exec(q)[1])]; return null; }
+    if (path === 'rpc/jl_multi_write') {   // tout ou rien : on travaille sur une copie
+      const snap = clone(tables);
+      try {
+        for (const o of body.p_ops) {
+          assert.ok(tables[o.t], 'table inconnue ' + o.t);
+          if (o.p.length === 0 && (o.v === null || o.v === undefined)) { delete tables[o.t][o.id]; continue; }
+          const cur = tables[o.t][o.id]; tables[o.t][o.id] = setPath(cur === undefined ? {} : clone(cur), o.p, o.v === undefined ? null : o.v) || {};
+        }
+      } catch (e) { Object.keys(tables).forEach((k) => { tables[k] = snap[k]; }); throw e; }
+      return true;
+    }
     if (path === 'rpc/jl_rec_write') {
       if (hook) { const h = hook; hook = null; h(tables); }
       const { p_table: t, p_id: id, p_path: p, p_value: v, p_mode: mode, p_expect: ex, p_check: chk } = body;
@@ -99,11 +110,11 @@ function fakeCall() {
   // validations
   await assert.rejects(() => db.ref('users').set({}), /interdit/);
   assert.throws(() => db.ref('users/a b'), /chemin invalide/);
-  assert.throws(() => db.ref('payments/x'), /non migré/);
+  assert.throws(() => db.ref('adminUsers/x'), /non migré/);
   // aiguillage hybride
   const fb = { ref: (p) => ({ from: 'firebase', p }) };
   const hy = createHybridDb({ firebaseDb: fb, sbDb: db, active: true });
-  assert.strictEqual(hy.ref('payments/t1').from, 'firebase');
+  assert.strictEqual(hy.ref('adminUsers/t1').from, 'firebase'); assert.ok(hy.ref('payments/t1').child, 'payments est migré');
   assert.ok(hy.ref('users/u1').child);
   const off = createHybridDb({ firebaseDb: fb, sbDb: db, active: false });
   assert.strictEqual(off.ref('users/u1').from, 'firebase', 'retour arrière RTDB_SOURCE=firebase');
@@ -111,8 +122,9 @@ function fakeCall() {
   const fbCalls = []; const fb2 = { ref: (p) => ({ update: async (u) => { fbCalls.push(u); } }) };
   const hy2 = createHybridDb({ firebaseDb: fb2, sbDb: db, active: true });
   await db.ref('users/m1').set({ name: 'M', referralBalance: 5 });
-  await hy2.ref().update({ 'payments/t9/status': 'done', 'users/m1/referralBalance': 30, 'users/m1/name': null, 'withdrawalRequests/w1': { a: 1 } });
-  assert.deepStrictEqual(fbCalls, [{ 'payments/t9/status': 'done', 'withdrawalRequests/w1': { a: 1 } }]);
+  await hy2.ref().update({ 'adminUsers/t9/role': 'x', 'users/m1/referralBalance': 30, 'users/m1/name': null, 'withdrawalRequests/w1': { a: 1 } });
+  assert.deepStrictEqual(fbCalls, [{ 'adminUsers/t9/role': 'x' }]);
+  assert.deepStrictEqual((await db.ref('withdrawalRequests/w1').get()).val(), { a: 1 });
   const m1 = (await db.ref('users/m1').get()).val(); assert.strictEqual(m1.referralBalance, 30); assert.ok(!('name' in m1));
   await hy2.ref().update({ 'users/m1': null }); assert.strictEqual((await db.ref('users/m1').get()).exists(), false);
   // codes de parrainage
@@ -120,7 +132,34 @@ function fakeCall() {
   assert.strictEqual((await db.ref('referralCodes/AB12').get()).val(), 'u7');
   assert.strictEqual((await db.ref('referralCodes/ZZ').get()).exists(), false);
   const fbc = []; const hy3 = createHybridDb({ firebaseDb: { ref: () => ({ update: async (u) => fbc.push(u) }) }, sbDb: db, active: true });
-  await hy3.ref().update({ 'referralCodes/AB12': null, 'payments/p': { a: 1 } });
-  assert.strictEqual((await db.ref('referralCodes/AB12').get()).exists(), false); assert.deepStrictEqual(fbc, [{ 'payments/p': { a: 1 } }]);
+  await hy3.ref().update({ 'referralCodes/AB12': null, 'adminUsers/p': { a: 1 } });
+  assert.strictEqual((await db.ref('referralCodes/AB12').get()).exists(), false); assert.deepStrictEqual(fbc, [{ 'adminUsers/p': { a: 1 } }]);
+  // ----- argent : valeurs simples, fiche unique, écritures atomiques
+  await db.ref('paymentThrottle/u1').set(1700000000000);
+  assert.strictEqual((await db.ref('paymentThrottle/u1').get()).val(), 1700000000000);
+  let tr = await db.ref('paymentThrottle/u1').transaction((c) => (typeof c === 'number' && 1700000000500 - c < 60000 ? undefined : 5));
+  assert.strictEqual(tr.committed, false);
+  tr = await db.ref('paymentThrottle/u2').transaction((c) => (c ? undefined : 42)); assert.deepStrictEqual([tr.committed, tr.snapshot.val()], [true, 42]);
+  await db.ref('platformStats/commissionTopups').transaction((c) => (c || 0) + 500);
+  await db.ref('platformStats/commissionTopups').transaction((c) => (c || 0) + 250);
+  assert.deepStrictEqual((await db.ref('platformStats').get()).val(), { commissionTopups: 750 });
+  assert.strictEqual(f.tables.platform_stats.main.commissionTopups, 750, 'une seule fiche « main »');
+  const pt = await db.ref('platformStats').transaction((cur) => Object.assign({}, cur, { commissionFlat: 100 })); assert.ok(pt.committed);
+  assert.deepStrictEqual((await db.ref('platformStats').get()).val(), { commissionTopups: 750, commissionFlat: 100 });
+  await db.ref('driverWallets/d1/commissionBalance').transaction((c) => (c || 0) + 500);
+  await db.ref('payments/t1').set({ clientUid: 'c1', status: 'pending', amount: 1000 });
+  // écriture atomique : paiement + portefeuille + statistiques en un seul bloc
+  await hy2.ref().update({ 'payments/t1/status': 'success', 'payments/t1/credited': 1, 'driverWallets/d1/commissionBalance': 1500, 'platformStats/commissionTopups': 1000 });
+  assert.strictEqual((await db.ref('payments/t1/status').get()).val(), 'success');
+  assert.strictEqual((await db.ref('driverWallets/d1/commissionBalance').get()).val(), 1500);
+  assert.strictEqual((await db.ref('platformStats/commissionTopups').get()).val(), 1000);
+  // si une des écritures échoue (table inconnue), RIEN n'est appliqué
+  const before = JSON.stringify(f.tables);
+  await assert.rejects(() => db.multiSet({ 'payments/t1/status': 'hack', 'driverWallets/d1/commissionBalance': 9999999, 'payments': null }), /interdite/);
+  assert.strictEqual(JSON.stringify(f.tables), before, 'aucune écriture partielle');
+  await assert.rejects(() => db.multiSet({ 'payments/t1/status': 'hack', 'inconnu/x': 1 }), /non migré/);
+  assert.strictEqual(JSON.stringify(f.tables), before);
+  // suppression via chemin complet
+  await db.multiSet({ 'payments/t1': null }); assert.strictEqual((await db.ref('payments/t1').get()).exists(), false);
   console.log('rtdb.test.js : tout est OK');
 })().catch((e) => { console.error(e); process.exit(1); });

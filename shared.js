@@ -3234,7 +3234,11 @@ module.exports = { createArchiveCore, ArchiveError, getArchiveCore, makeArchive,
 // tous les autres restent sur Firebase tant que leur migration n'est pas faite (RTDB_SOURCE=firebase = retour arrière).
 __define('rtdb', function (module, exports, require) {
 'use strict';
-const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity', deliveryRequests: 'delivery_requests', marketplaceOrders: 'marketplace_orders', deliveryCodes: 'delivery_codes', locationRequests: 'location_requests', notifications: 'notifications', supportTickets: 'support_tickets', tickets: 'ticket_registry', reports: 'reports', sponsoredReels: 'sponsored_reels', sponsorStats: 'sponsor_stats' };
+const ROUTES = { users: 'profiles', drivers: 'drivers', driverPublic: 'driver_public', enterprises: 'enterprises', registrations: 'registrations', userAffinity: 'user_affinity', deliveryRequests: 'delivery_requests', marketplaceOrders: 'marketplace_orders', deliveryCodes: 'delivery_codes', locationRequests: 'location_requests', notifications: 'notifications', supportTickets: 'support_tickets', tickets: 'ticket_registry', reports: 'reports', sponsoredReels: 'sponsored_reels', sponsorStats: 'sponsor_stats',
+  payments: 'payments', withdrawalRequests: 'withdrawal_requests', commissionPayments: 'commission_payments', remittances: 'remittances', platformStats: 'platform_stats', referralCredits: 'referral_credits',
+  referrals: 'referrals', driverWallets: 'driver_wallets', commissionLedger: 'commission_ledger', driverPayoutAccounts: 'driver_payout_accounts', paymentThrottle: 'payment_throttle', withdrawThrottle: 'withdraw_throttle',
+  otps: 'otps', mockSmsLog: 'mock_sms_log' };
+const SINGLETON = { platformStats: 'main' };   // nœud stocké dans une seule fiche (id fixe)
 const SEG_RE = /^[A-Za-z0-9_.@:+-]{1,200}$/;
 const SPECIAL = ['referralCodes'];   // nœuds routés vers Supabase mais stockés dans une table à part (code -> uid)
 
@@ -3360,7 +3364,25 @@ function createSupabaseDb({ call, now }) {
     if (segs[0] === 'referralCodes') { if (segs.length !== 2) throw new Error('referralCodes : un code à la fois'); return codeRef(segs[1]); }
     const table = ROUTES[segs[0]];
     if (!table) throw new Error('nœud non migré : ' + segs[0]);
-    return makeRef(table, segs.slice(1));
+    const rest = segs.slice(1);
+    return makeRef(table, SINGLETON[segs[0]] ? [SINGLETON[segs[0]]].concat(rest) : rest);
+  },
+  // Plusieurs écritures (chemins complets, valeur null = suppression) dans UNE transaction Postgres : tout passe ou rien.
+  async multiSet(upd) {
+    const ops = [], special = [];
+    for (const k of Object.keys(upd || {})) {
+      const segs = String(k).split('/').filter(Boolean);
+      if (segs[0] === 'referralCodes') { special.push(k); continue; }
+      for (const s of segs) if (!SEG_RE.test(s)) throw new Error('chemin invalide');
+      const table = ROUTES[segs[0]];
+      if (!table) throw new Error('nœud non migré : ' + segs[0]);
+      const rest = segs.slice(1);
+      const full = SINGLETON[segs[0]] ? [SINGLETON[segs[0]]].concat(rest) : rest;
+      if (!full.length) throw new Error('écriture sur un nœud entier interdite');
+      ops.push({ t: table, id: full[0], p: full.slice(1), v: clean(upd[k]) });
+    }
+    if (ops.length) await call('POST', 'rpc/jl_multi_write', { p_ops: ops });
+    for (const k of special) await this.ref(k).set(upd[k]);   // codes de parrainage : table à part
   } };
 }
 
@@ -3377,7 +3399,7 @@ function createHybridDb({ firebaseDb, sbDb, active }) {
         const fb = {}, sbk = [];
         for (const k of Object.keys(upd || {})) { if (routed(k)) sbk.push(k); else fb[k] = upd[k]; }
         if (Object.keys(fb).length) await firebaseDb.ref().update(fb);
-        for (const k of sbk) await sbDb.ref(k).set(upd[k]);
+        if (sbk.length) { const part = {}; sbk.forEach((k) => { part[k] = upd[k]; }); await sbDb.multiSet(part); }
       } };
     }
     if (active && isRouted(first)) return sbDb.ref(path);
